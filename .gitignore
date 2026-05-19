@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.pytest_cache
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+htmlcov/
+.dist-info/
+.eggs/
+.installed.cfg
+*.egg-info/
+pip-log.txt
+pip-delete-this-directory.txt
+python-env/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.*
+
+# Docker
+docker-compose.override.yml
+*.log
+
+# Local files
+*.sqlite3
+*.db
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Distribution files
+build/
+dist/
+*.egg
+*.egg-info/
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# PyCharm
+.idea/
+*.iml
+
+# Node modules (if using frontend tooling)
+node_modules/
+
+# Ignore any generated files from Docker build context
+docker-compose.override.yml
+
+# Persistent storage / local data
+*.pid
+*.seed
+*~
