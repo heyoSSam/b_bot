@@ -35,4 +35,4 @@ uvloop==0.22.1
 watchfiles==1.1.1
 websockets==16.0
 yarl==1.23.0
-psycopg2==2.9.7
+asyncpg==0.30.0
