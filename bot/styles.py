@@ -97,9 +97,11 @@ def build_track_caption_for_style(
     text: str | None = None,
     user: User | None = None,
     telegram_user: TelegramUser | None = None,
+    include_bot_credit: bool = True,
 ) -> str:
     footer = render_name_style(style, message, authors, user, telegram_user)
-    footer = f"{footer}\n\n{html.escape(BOT_CREDIT_TEXT)}" if footer else html.escape(BOT_CREDIT_TEXT)
+    if include_bot_credit:
+        footer = f"{footer}\n\n{html.escape(BOT_CREDIT_TEXT)}" if footer else html.escape(BOT_CREDIT_TEXT)
 
     if text and text.strip():
         return f"{html.escape(text.strip())}\n\n{footer}"
@@ -113,6 +115,15 @@ def build_track_caption(
     text: str | None = None,
     user: User | None = None,
     telegram_user: TelegramUser | None = None,
+    include_bot_credit: bool = True,
 ) -> str:
     style = user.name_style if user else DEFAULT_NAME_STYLE
-    return build_track_caption_for_style(style, message, authors, text, user, telegram_user)
+    return build_track_caption_for_style(
+        style,
+        message,
+        authors,
+        text,
+        user,
+        telegram_user,
+        include_bot_credit,
+    )

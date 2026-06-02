@@ -35,14 +35,33 @@ router = Router()
 
 class BeatState(StatesGroup):
     waiting_for_audio = State()
+    choosing_next_step = State()
     waiting_for_collab_answer = State()
     waiting_for_author_links = State()
     waiting_for_file_name = State()
     waiting_for_cover = State()
 
 
+def with_beat_back_button(reply_markup: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
+    inline_keyboard = []
+
+    if reply_markup:
+        inline_keyboard.extend(reply_markup.inline_keyboard)
+
+    inline_keyboard.append(
+        [
+            InlineKeyboardButton(
+                text="Вернуться к биту",
+                callback_data="beat:menu",
+            )
+        ]
+    )
+
+    return with_start_button(InlineKeyboardMarkup(inline_keyboard=inline_keyboard))
+
+
 def get_collab_keyboard() -> InlineKeyboardMarkup:
-    return with_start_button(
+    return with_beat_back_button(
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -54,8 +73,24 @@ def get_collab_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def get_cover_keyboard() -> InlineKeyboardMarkup:
+def get_beat_menu_keyboard(has_cover: bool) -> InlineKeyboardMarkup:
+    cover_button_text = "Заменить обложку" if has_cover else "Добавить обложку"
     return with_start_button(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Собрать сейчас", callback_data="beat:build")],
+                [
+                    InlineKeyboardButton(text="Переименовать", callback_data="beat:file_name"),
+                    InlineKeyboardButton(text="Соавторы", callback_data="beat:authors"),
+                ],
+                [InlineKeyboardButton(text=cover_button_text, callback_data="beat:cover")],
+            ]
+        )
+    )
+
+
+def get_cover_keyboard() -> InlineKeyboardMarkup:
+    return with_beat_back_button(
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Без обложки", callback_data="beat:cover:skip")]
@@ -129,13 +164,38 @@ async def ask_for_file_name(message: Message, state: FSMContext):
         message,
         state,
         build_file_name_prompt(audio_file_name),
-        reply_markup=with_start_button(
+        reply_markup=with_beat_back_button(
             get_file_name_copy_keyboard(
                 audio_file_name,
                 keep_callback_data="beat:file_name:keep",
             )
         ),
         parse_mode="HTML",
+    )
+
+
+async def show_beat_menu(message: Message, state: FSMContext, bot: Bot, notice: str | None = None) -> None:
+    data = await state.get_data()
+    safe_audio_file_name = get_safe_audio_name(data.get("audio_file_name"), "beat.mp3")
+    has_cover = bool(data.get("cover_file_id"))
+    has_authors = bool(data.get("authors"))
+    text = (
+        f"Файл: {safe_audio_file_name}. "
+        f"Соавторы: {'есть' if has_authors else 'нет'}. "
+        f"Обложка: {'есть' if has_cover else 'нет'}. "
+        "Можно собрать сейчас или изменить параметры."
+    )
+
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    await cleanup_messages(bot, state, message.chat.id)
+    await state.set_state(BeatState.choosing_next_step)
+    await answer_and_track(
+        message,
+        state,
+        text,
+        reply_markup=get_beat_menu_keyboard(has_cover),
     )
 
 
@@ -156,15 +216,10 @@ async def accept_beat_audio(message: Message, state: FSMContext, bot: Bot) -> No
     await state.update_data(
         audio_file_id=audio_file_id,
         audio_file_name=audio_file_name,
+        authors=[],
+        cover_file_id=None,
     )
-    await cleanup_messages(bot, state, message.chat.id)
-    await state.set_state(BeatState.waiting_for_collab_answer)
-    await answer_and_track(
-        message,
-        state,
-        "Этот бит коллабный?",
-        reply_markup=get_collab_keyboard(),
-    )
+    await show_beat_menu(message, state, bot)
 
 
 async def build_and_send_beat(
@@ -172,11 +227,11 @@ async def build_and_send_beat(
     state: FSMContext,
     bot: Bot,
     db_session: AsyncSession,
-    cover_file_id: str | None,
     telegram_user,
 ) -> None:
     data = await state.get_data()
     safe_audio_file_name = get_safe_audio_name(data["audio_file_name"], "beat.mp3")
+    cover_file_id = data.get("cover_file_id")
 
     await answer_and_track(message, state, "Обрабатываю бит...")
 
@@ -275,6 +330,7 @@ async def direct_beat_audio_handler(message: Message, state: FSMContext, bot: Bo
 
 
 @router.message(BeatState.waiting_for_audio, has_audio_file)
+@router.message(BeatState.choosing_next_step, has_audio_file)
 async def beat_audio_handler(message: Message, state: FSMContext, bot: Bot):
     await accept_beat_audio(message, state, bot)
 
@@ -290,6 +346,72 @@ async def wrong_beat_audio_handler(message: Message, state: FSMContext):
     )
 
 
+@router.message(BeatState.choosing_next_step, is_not_command)
+async def wrong_beat_menu_handler(message: Message, state: FSMContext):
+    await add_cleanup_message(state, message)
+    data = await state.get_data()
+    await answer_and_track(
+        message,
+        state,
+        "Используйте кнопки ниже или отправьте новый mp3-бит.",
+        reply_markup=get_beat_menu_keyboard(bool(data.get("cover_file_id"))),
+    )
+
+
+@router.callback_query(BeatState.choosing_next_step, F.data == "beat:build")
+async def beat_build_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await build_and_send_beat(callback.message, state, bot, db_session, callback.from_user)
+
+
+@router.callback_query(BeatState.choosing_next_step, F.data == "beat:file_name")
+async def beat_choose_file_name_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await cleanup_messages(bot, state, callback.message.chat.id)
+        await ask_for_file_name(callback.message, state)
+
+
+@router.callback_query(BeatState.choosing_next_step, F.data == "beat:authors")
+async def beat_choose_authors_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await cleanup_messages(bot, state, callback.message.chat.id)
+        await state.set_state(BeatState.waiting_for_collab_answer)
+        await answer_and_track(
+            callback.message,
+            state,
+            "Этот бит коллабный?",
+            reply_markup=get_collab_keyboard(),
+        )
+
+
+@router.callback_query(BeatState.choosing_next_step, F.data == "beat:cover")
+async def beat_choose_cover_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await cleanup_messages(bot, state, callback.message.chat.id)
+        await ask_for_cover(callback.message, state)
+
+
 @router.callback_query(BeatState.waiting_for_collab_answer, F.data == "beat:collab:yes")
 async def beat_collab_yes_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
@@ -303,7 +425,7 @@ async def beat_collab_yes_handler(callback: CallbackQuery, state: FSMContext, bo
             callback.message,
             state,
             "Отправьте ссылки на авторов через пробел, запятую или с новой строки.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_beat_back_button(),
         )
 
 
@@ -315,8 +437,7 @@ async def beat_collab_no_handler(callback: CallbackQuery, state: FSMContext, bot
 
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
-        await cleanup_messages(bot, state, callback.message.chat.id)
-        await ask_for_file_name(callback.message, state)
+        await show_beat_menu(callback.message, state, bot, "Соавторы убраны.")
 
 
 @router.message(BeatState.waiting_for_author_links, F.text)
@@ -329,13 +450,12 @@ async def beat_author_links_handler(message: Message, state: FSMContext, bot: Bo
             message,
             state,
             "Отправьте хотя бы одну ссылку: https://..., t.me/... или @username.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_beat_back_button(),
         )
         return
 
     await state.update_data(authors=authors)
-    await cleanup_messages(bot, state, message.chat.id)
-    await ask_for_file_name(message, state)
+    await show_beat_menu(message, state, bot, "Соавторы обновлены.")
 
 
 @router.message(BeatState.waiting_for_author_links, is_not_command)
@@ -345,7 +465,7 @@ async def wrong_beat_author_links_handler(message: Message, state: FSMContext):
         message,
         state,
         "Сейчас нужно отправить ссылки на авторов.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_beat_back_button(),
     )
 
 
@@ -359,13 +479,12 @@ async def beat_file_name_handler(message: Message, state: FSMContext, bot: Bot):
             message,
             state,
             "Отправьте новое название файла текстом.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_beat_back_button(),
         )
         return
 
     await state.update_data(audio_file_name=file_name)
-    await cleanup_messages(bot, state, message.chat.id)
-    await ask_for_cover(message, state)
+    await show_beat_menu(message, state, bot, "Название обновлено.")
 
 
 @router.callback_query(BeatState.waiting_for_file_name, F.data == "beat:file_name:keep")
@@ -375,8 +494,7 @@ async def beat_keep_file_name_handler(callback: CallbackQuery, state: FSMContext
 
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
-        await cleanup_messages(bot, state, callback.message.chat.id)
-        await ask_for_cover(callback.message, state)
+        await show_beat_menu(callback.message, state, bot)
 
 
 @router.message(BeatState.waiting_for_file_name, is_not_command)
@@ -386,7 +504,7 @@ async def wrong_beat_file_name_handler(message: Message, state: FSMContext):
         message,
         state,
         "Сейчас нужно отправить новое название файла текстом.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_beat_back_button(),
     )
 
 
@@ -396,7 +514,6 @@ async def beat_cover_handler(
     message: Message,
     state: FSMContext,
     bot: Bot,
-    db_session: AsyncSession,
 ):
     await add_cleanup_message(state, message)
     cover_file_id = get_cover_file_id(message)
@@ -406,11 +523,12 @@ async def beat_cover_handler(
             message,
             state,
             "Отправьте обложку как фото/файл JPEG/PNG или нажмите «Без обложки».",
-            reply_markup=get_start_keyboard(),
+            reply_markup=get_cover_keyboard(),
         )
         return
 
-    await build_and_send_beat(message, state, bot, db_session, cover_file_id, message.from_user)
+    await state.update_data(cover_file_id=cover_file_id)
+    await show_beat_menu(message, state, bot, "Обложка обновлена.")
 
 
 @router.callback_query(BeatState.waiting_for_cover, F.data == "beat:cover:skip")
@@ -418,14 +536,14 @@ async def beat_skip_cover_handler(
     callback: CallbackQuery,
     state: FSMContext,
     bot: Bot,
-    db_session: AsyncSession,
 ):
     await callback.answer()
     await add_cleanup_message(state, callback.message)
 
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
-        await build_and_send_beat(callback.message, state, bot, db_session, None, callback.from_user)
+        await state.update_data(cover_file_id=None)
+        await show_beat_menu(callback.message, state, bot, "Обложка убрана.")
 
 
 @router.message(BeatState.waiting_for_cover, is_not_command)
@@ -435,5 +553,18 @@ async def wrong_beat_cover_handler(message: Message, state: FSMContext):
         message,
         state,
         "Сейчас нужно отправить обложку как фото/файл JPEG/PNG или нажать «Без обложки».",
-        reply_markup=get_start_keyboard(),
+        reply_markup=get_cover_keyboard(),
     )
+
+
+@router.callback_query(BeatState.waiting_for_collab_answer, F.data == "beat:menu")
+@router.callback_query(BeatState.waiting_for_author_links, F.data == "beat:menu")
+@router.callback_query(BeatState.waiting_for_file_name, F.data == "beat:menu")
+@router.callback_query(BeatState.waiting_for_cover, F.data == "beat:menu")
+async def beat_back_to_menu_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await show_beat_menu(callback.message, state, bot)

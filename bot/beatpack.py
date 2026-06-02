@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import os
 import tempfile
+from dataclasses import dataclass, field
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -13,12 +15,14 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaAudio,
     Message,
+    User as TelegramUser,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.audio import add_cover_to_mp3, create_audio_thumbnail
+from bot.audio import add_cover_bytes_to_mp3, create_audio_thumbnail, prepare_cover_bytes
 from bot.authors import resolve_authors
 from bot.cleanup import add_cleanup_message, answer_and_track, cleanup_messages
+from bot.constants import BEATPACK_BUILD_MAX_CONCURRENCY, BEATPACK_MEDIA_GROUP_COLLECT_SECONDS
 from bot.file_names import (
     build_file_name_prompt,
     get_file_name_copy_keyboard,
@@ -34,6 +38,20 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+@dataclass
+class BeatpackMediaGroupBatch:
+    tracks: list[dict] = field(default_factory=list)
+    messages: list[Message] = field(default_factory=list)
+    invalid_count: int = 0
+    state: FSMContext | None = None
+    bot: Bot | None = None
+    telegram_user: TelegramUser | None = None
+    task: asyncio.Task | None = None
+
+
+beatpack_media_group_batches: dict[tuple[int, int, str], BeatpackMediaGroupBatch] = {}
+
+
 class BeatpackState(StatesGroup):
     waiting_for_audio = State()
     waiting_for_collab_answer = State()
@@ -44,7 +62,7 @@ class BeatpackState(StatesGroup):
 
 
 def get_collab_keyboard() -> InlineKeyboardMarkup:
-    return with_start_button(
+    return with_beatpack_back_button(
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -56,17 +74,69 @@ def get_collab_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def get_next_step_keyboard() -> InlineKeyboardMarkup:
+def get_beatpack_menu_keyboard(tracks: list[dict]) -> InlineKeyboardMarkup:
+    inline_keyboard = [
+        [
+            InlineKeyboardButton(
+                text=get_safe_audio_name(track.get("file_name"), f"beat_{index}.mp3"),
+                callback_data=f"beatpack:edit:{index - 1}",
+            )
+        ]
+        for index, track in enumerate(tracks, start=1)
+    ]
+
+    inline_keyboard.append(
+        [
+            InlineKeyboardButton(text="Добавить биты", callback_data="beatpack:add"),
+            InlineKeyboardButton(text="Готово", callback_data="beatpack:done"),
+        ]
+    )
+
     return with_start_button(
+        InlineKeyboardMarkup(
+            inline_keyboard=inline_keyboard
+        )
+    )
+
+
+def get_beatpack_track_action_keyboard() -> InlineKeyboardMarkup:
+    return with_beatpack_back_button(
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="Добавить ещё бит", callback_data="beatpack:add"),
-                    InlineKeyboardButton(text="Готово", callback_data="beatpack:done"),
-                ]
+                    InlineKeyboardButton(text="Переименовать", callback_data="beatpack:track:file_name"),
+                    InlineKeyboardButton(text="Соавторы", callback_data="beatpack:track:authors"),
+                ],
+                [
+                    InlineKeyboardButton(text="Вверх", callback_data="beatpack:track:move:up"),
+                    InlineKeyboardButton(text="Вниз", callback_data="beatpack:track:move:down"),
+                ],
+                [
+                    InlineKeyboardButton(text="В начало", callback_data="beatpack:track:move:first"),
+                    InlineKeyboardButton(text="В конец", callback_data="beatpack:track:move:last"),
+                ],
+                [InlineKeyboardButton(text="Удалить", callback_data="beatpack:track:delete")],
             ]
         )
     )
+
+
+def with_beatpack_back_button(reply_markup: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
+    inline_keyboard = []
+
+    if reply_markup:
+        inline_keyboard.extend(reply_markup.inline_keyboard)
+
+    inline_keyboard.append(
+        [
+            InlineKeyboardButton(
+                text="Вернуться к битпаку",
+                callback_data="beatpack:menu",
+            )
+        ]
+    )
+
+    return with_start_button(InlineKeyboardMarkup(inline_keyboard=inline_keyboard))
 
 
 def get_cover_keyboard() -> InlineKeyboardMarkup:
@@ -79,30 +149,121 @@ def get_cover_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def save_pending_track(state: FSMContext) -> int:
+async def append_tracks(state: FSMContext, new_tracks: list[dict]) -> int:
     data = await state.get_data()
     tracks = list(data.get("tracks", []))
-
-    tracks.append(
-        {
-            "file_id": data["pending_audio_file_id"],
-            "file_name": data["pending_audio_file_name"],
-            "authors": data.get("pending_authors") or [],
-        }
-    )
-
-    await state.update_data(
-        tracks=tracks,
-        pending_audio_file_id=None,
-        pending_audio_file_name=None,
-        pending_authors=None,
-    )
-
+    tracks.extend(new_tracks)
+    await state.update_data(tracks=tracks)
     return len(tracks)
+
+
+def get_track_from_mp3_file(mp3_file: tuple[str, str]) -> dict:
+    audio_file_id, audio_file_name = mp3_file
+    return {
+        "file_id": audio_file_id,
+        "file_name": audio_file_name,
+        "authors": [],
+    }
+
+
+def get_indexed_track(data: dict) -> tuple[int | None, dict | None]:
+    tracks = data.get("tracks", [])
+    track_index = data.get("editing_track_index")
+
+    if not isinstance(track_index, int) or track_index < 0 or track_index >= len(tracks):
+        return None, None
+
+    return track_index, tracks[track_index]
+
+
+async def update_editing_track(state: FSMContext, **values) -> int | None:
+    data = await state.get_data()
+    track_index, track = get_indexed_track(data)
+
+    if track_index is None or track is None:
+        return None
+
+    tracks = list(data.get("tracks", []))
+    updated_track = dict(track)
+    updated_track.update(values)
+    tracks[track_index] = updated_track
+    await state.update_data(tracks=tracks)
+    return track_index
+
+
+async def move_editing_track(state: FSMContext, direction: str) -> tuple[int | None, str | None]:
+    data = await state.get_data()
+    track_index, track = get_indexed_track(data)
+    tracks = list(data.get("tracks", []))
+
+    if track_index is None or track is None:
+        return None, "Бит не найден."
+
+    if direction == "up":
+        if track_index == 0:
+            return track_index, "Бит уже на первом месте."
+
+        tracks[track_index - 1], tracks[track_index] = tracks[track_index], tracks[track_index - 1]
+        track_index -= 1
+    elif direction == "down":
+        if track_index == len(tracks) - 1:
+            return track_index, "Бит уже на последнем месте."
+
+        tracks[track_index + 1], tracks[track_index] = tracks[track_index], tracks[track_index + 1]
+        track_index += 1
+    elif direction == "first":
+        if track_index == 0:
+            return track_index, "Бит уже на первом месте."
+
+        tracks.pop(track_index)
+        tracks.insert(0, track)
+        track_index = 0
+    elif direction == "last":
+        if track_index == len(tracks) - 1:
+            return track_index, "Бит уже на последнем месте."
+
+        tracks.pop(track_index)
+        tracks.append(track)
+        track_index = len(tracks) - 1
+    else:
+        return track_index, "Не удалось изменить порядок."
+
+    await state.update_data(tracks=tracks, editing_track_index=track_index)
+    return track_index, None
+
+
+async def delete_editing_track(state: FSMContext) -> bool:
+    data = await state.get_data()
+    track_index, _ = get_indexed_track(data)
+    tracks = list(data.get("tracks", []))
+
+    if track_index is None:
+        return False
+
+    tracks.pop(track_index)
+    await state.update_data(tracks=tracks, editing_track_index=None)
+    return True
 
 
 def split_media(media: list[InputMediaAudio]) -> list[list[InputMediaAudio]]:
     return [media[index : index + 10] for index in range(0, len(media), 10)]
+
+
+async def answer_media_audio(message: Message, media_audio: InputMediaAudio) -> Message:
+    audio_kwargs = {
+        "audio": media_audio.media,
+        "caption": media_audio.caption,
+        "parse_mode": media_audio.parse_mode,
+    }
+    title = getattr(media_audio, "title", None)
+
+    if title:
+        audio_kwargs["title"] = title
+
+    if media_audio.thumbnail:
+        audio_kwargs["thumbnail"] = media_audio.thumbnail
+
+    return await message.answer_audio(**audio_kwargs)
 
 
 def is_not_command(message: Message) -> bool:
@@ -149,14 +310,25 @@ def get_cover_file_id(message: Message) -> str | None:
 
 async def ask_for_file_name(message: Message, state: FSMContext):
     data = await state.get_data()
-    audio_file_name = get_safe_audio_name(data.get("pending_audio_file_name"), "beat.mp3")
+    track_index, track = get_indexed_track(data)
+
+    if track_index is None or track is None:
+        await answer_and_track(
+            message,
+            state,
+            "Бит не найден. Вернитесь к битпаку и выберите бит заново.",
+            reply_markup=with_beatpack_back_button(),
+        )
+        return
+
+    audio_file_name = get_safe_audio_name(track.get("file_name"), f"beat_{track_index + 1}.mp3")
 
     await state.set_state(BeatpackState.waiting_for_file_name)
     await answer_and_track(
         message,
         state,
         build_file_name_prompt(audio_file_name),
-        reply_markup=with_start_button(
+        reply_markup=with_beatpack_back_button(
             get_file_name_copy_keyboard(
                 audio_file_name,
                 keep_callback_data="beatpack:file_name:keep",
@@ -174,6 +346,215 @@ async def ask_for_cover(message: Message, state: FSMContext):
         "Теперь отправьте обложку для битпака или нажмите «Без обложки».",
         reply_markup=get_cover_keyboard(),
     )
+
+
+async def send_beatpack_preview(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+    tracks: list[dict],
+    telegram_user: TelegramUser | None,
+) -> None:
+    user = await get_user(db_session, telegram_user.id) if telegram_user else None
+    media = []
+
+    for index, track in enumerate(tracks, start=1):
+        safe_name = get_safe_audio_name(track.get("file_name"), f"beat_{index}.mp3")
+        media.append(
+            InputMediaAudio(
+                media=track["file_id"],
+                caption=build_track_caption(
+                    message,
+                    track.get("authors", []),
+                    user=user,
+                    telegram_user=telegram_user,
+                    include_bot_credit=index == len(tracks),
+                ),
+                parse_mode="HTML",
+                title=safe_name,
+            )
+        )
+
+    if len(media) == 1:
+        sent_message = await answer_media_audio(message, media[0])
+        await add_cleanup_message(state, sent_message)
+        return
+
+    for media_group in split_media(media):
+        if len(media_group) == 1:
+            sent_message = await answer_media_audio(message, media_group[0])
+            await add_cleanup_message(state, sent_message)
+            continue
+
+        sent_messages = await bot.send_media_group(chat_id=message.chat.id, media=media_group)
+
+        for sent_message in sent_messages:
+            await add_cleanup_message(state, sent_message)
+
+
+async def show_beatpack_menu(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+    telegram_user: TelegramUser | None,
+    notice: str | None = None,
+) -> None:
+    data = await state.get_data()
+    tracks = data.get("tracks", [])
+    await cleanup_messages(bot, state, message.chat.id)
+
+    if not tracks:
+        await state.set_state(BeatpackState.waiting_for_audio)
+        await answer_and_track(
+            message,
+            state,
+            "Битпак пустой. Отправьте mp3-биты.",
+            reply_markup=get_start_keyboard(),
+        )
+        return
+
+    await state.update_data(editing_track_index=None)
+    await state.set_state(BeatpackState.choosing_next_step)
+    await send_beatpack_preview(message, state, bot, db_session, tracks, telegram_user)
+
+    text = f"Битпак сейчас: {len(tracks)} битов."
+
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    await answer_and_track(
+        message,
+        state,
+        f"{text}\nВыберите бит для редактирования или нажмите «Готово».",
+        reply_markup=get_beatpack_menu_keyboard(tracks),
+    )
+
+
+async def show_beatpack_track_action_menu(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    notice: str | None = None,
+) -> None:
+    data = await state.get_data()
+    track_index, track = get_indexed_track(data)
+    tracks = data.get("tracks", [])
+
+    if track_index is None or track is None:
+        await answer_and_track(
+            message,
+            state,
+            "Бит не найден. Вернитесь к битпаку и выберите бит заново.",
+            reply_markup=with_beatpack_back_button(),
+        )
+        return
+
+    safe_name = get_safe_audio_name(track.get("file_name"), f"beat_{track_index + 1}.mp3")
+    text = f"Редактируем «{safe_name}». Позиция: {track_index + 1} из {len(tracks)}."
+
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    await cleanup_messages(bot, state, message.chat.id)
+    await state.set_state(BeatpackState.choosing_next_step)
+    await answer_and_track(
+        message,
+        state,
+        text,
+        reply_markup=get_beatpack_track_action_keyboard(),
+    )
+
+
+async def flush_beatpack_media_group(key: tuple[int, int, str]) -> None:
+    await asyncio.sleep(BEATPACK_MEDIA_GROUP_COLLECT_SECONDS)
+    batch = beatpack_media_group_batches.pop(key, None)
+
+    if not batch or not batch.state or not batch.bot or not batch.messages:
+        return
+
+    message = batch.messages[-1]
+    current_state = await batch.state.get_state()
+
+    if current_state not in (
+        BeatpackState.waiting_for_audio.state,
+        BeatpackState.choosing_next_step.state,
+    ):
+        return
+
+    try:
+        if not batch.tracks:
+            await cleanup_messages(batch.bot, batch.state, message.chat.id)
+            await batch.state.set_state(BeatpackState.waiting_for_audio)
+            await answer_and_track(
+                message,
+                batch.state,
+                "Пока поддерживаются только mp3-файлы.",
+                reply_markup=get_start_keyboard(),
+            )
+            return
+
+        await append_tracks(batch.state, batch.tracks)
+        notice = None
+
+        if batch.invalid_count:
+            notice = f"Добавлено mp3: {len(batch.tracks)}. Пропущено не mp3: {batch.invalid_count}."
+
+        from bot.database import async_session as session_factory
+
+        async with session_factory() as db_session:
+            await show_beatpack_menu(
+                message,
+                batch.state,
+                batch.bot,
+                db_session,
+                batch.telegram_user,
+                notice,
+            )
+    except Exception:
+        logger.exception("Failed to process beatpack media group")
+        await cleanup_messages(batch.bot, batch.state, message.chat.id)
+        await batch.state.set_state(BeatpackState.waiting_for_audio)
+        await answer_and_track(
+            message,
+            batch.state,
+            "Не удалось обработать биты. Отправьте mp3-файлы ещё раз.",
+            reply_markup=get_start_keyboard(),
+        )
+
+
+def add_to_beatpack_media_group(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    mp3_file: tuple[str, str] | None,
+) -> bool:
+    if not message.media_group_id:
+        return False
+
+    user_id = message.from_user.id if message.from_user else 0
+    key = (message.chat.id, user_id, message.media_group_id)
+    batch = beatpack_media_group_batches.get(key)
+
+    if not batch:
+        batch = BeatpackMediaGroupBatch()
+        beatpack_media_group_batches[key] = batch
+
+    batch.messages.append(message)
+    batch.state = state
+    batch.bot = bot
+    batch.telegram_user = message.from_user
+
+    if mp3_file:
+        batch.tracks.append(get_track_from_mp3_file(mp3_file))
+    else:
+        batch.invalid_count += 1
+
+    if not batch.task or batch.task.done():
+        batch.task = asyncio.create_task(flush_beatpack_media_group(key))
+
+    return True
 
 
 async def build_and_send_beatpack(
@@ -204,6 +585,7 @@ async def build_and_send_beatpack(
         with tempfile.TemporaryDirectory() as temp_dir:
             media = []
             cover_path = None
+            cover_data = None
             thumbnail_path = None
 
             if cover_file_id:
@@ -211,49 +593,52 @@ async def build_and_send_beatpack(
                 thumbnail_path = os.path.join(temp_dir, "thumbnail.jpg")
                 await bot.download(cover_file_id, destination=cover_path)
                 create_audio_thumbnail(cover_path, thumbnail_path)
+                cover_data = await asyncio.to_thread(prepare_cover_bytes, cover_path)
 
-            for index, track in enumerate(tracks, start=1):
-                safe_name = get_safe_audio_name(track["file_name"], f"beat_{index}.mp3")
-                audio_path = os.path.join(temp_dir, f"{index}_{safe_name}")
+            semaphore = asyncio.Semaphore(BEATPACK_BUILD_MAX_CONCURRENCY)
 
-                await bot.download(track["file_id"], destination=audio_path)
+            async def build_track_media(index: int, track: dict) -> InputMediaAudio:
+                async with semaphore:
+                    safe_name = get_safe_audio_name(track["file_name"], f"beat_{index}.mp3")
+                    audio_path = os.path.join(temp_dir, f"{index}_{safe_name}")
 
-                media_kwargs = {
-                    "media": FSInputFile(audio_path, filename=safe_name),
-                    "caption": build_track_caption(
-                        message,
-                        track.get("authors", []),
-                        user=user,
-                        telegram_user=telegram_user,
-                    ),
-                    "parse_mode": "HTML",
-                }
+                    await bot.download(track["file_id"], destination=audio_path)
 
-                if cover_path and thumbnail_path:
-                    add_cover_to_mp3(audio_path, cover_path)
-                    media_kwargs["thumbnail"] = FSInputFile(
-                        thumbnail_path,
-                        filename=f"thumbnail_{index}.jpg",
-                    )
+                    if cover_data:
+                        await asyncio.to_thread(add_cover_bytes_to_mp3, audio_path, cover_data)
 
-                media.append(InputMediaAudio(**media_kwargs))
+                    media_kwargs = {
+                        "media": FSInputFile(audio_path, filename=safe_name),
+                        "caption": build_track_caption(
+                            message,
+                            track.get("authors", []),
+                            user=user,
+                            telegram_user=telegram_user,
+                            include_bot_credit=index == len(tracks),
+                        ),
+                        "parse_mode": "HTML",
+                    }
 
-            if len(media) == 1:
-                audio_kwargs = {
-                    "audio": media[0].media,
-                    "caption": media[0].caption,
-                    "parse_mode": "HTML",
-                }
+                    if thumbnail_path:
+                        media_kwargs["thumbnail"] = FSInputFile(
+                            thumbnail_path,
+                            filename=f"thumbnail_{index}.jpg",
+                        )
 
-                if media[0].thumbnail:
-                    audio_kwargs["thumbnail"] = media[0].thumbnail
+                    return InputMediaAudio(**media_kwargs)
 
-                await cleanup_messages(bot, state, message.chat.id)
-                await message.answer_audio(**audio_kwargs)
-            else:
-                await cleanup_messages(bot, state, message.chat.id)
-                for media_group in split_media(media):
-                    await bot.send_media_group(chat_id=message.chat.id, media=media_group)
+            media = await asyncio.gather(
+                *(build_track_media(index, track) for index, track in enumerate(tracks, start=1))
+            )
+
+            await cleanup_messages(bot, state, message.chat.id)
+
+            for media_group in split_media(media):
+                if len(media_group) == 1:
+                    await answer_media_audio(message, media_group[0])
+                    continue
+
+                await bot.send_media_group(chat_id=message.chat.id, media=media_group)
     except Exception:
         logger.exception("Failed to build beatpack")
         await cleanup_messages(bot, state, message.chat.id)
@@ -281,7 +666,7 @@ async def start_beatpack(message: Message, state: FSMContext, bot: Bot):
     await answer_and_track(
         message,
         state,
-        "Отправьте первый mp3-бит для битпака.",
+        "Отправьте mp3-биты для битпака. Можно отправить несколько файлов сразу.",
         reply_markup=get_start_keyboard(),
     )
 
@@ -304,15 +689,24 @@ async def check_beatpack_subscription(callback: CallbackQuery, state: FSMContext
         await answer_and_track(
             callback.message,
             state,
-            "Подписка подтверждена. Отправьте первый mp3-бит.",
+            "Подписка подтверждена. Отправьте mp3-биты для битпака.",
             reply_markup=get_start_keyboard(),
         )
 
 
 @router.message(BeatpackState.waiting_for_audio, has_audio_file)
-async def beatpack_audio_handler(message: Message, state: FSMContext, bot: Bot):
+@router.message(BeatpackState.choosing_next_step, has_audio_file)
+async def beatpack_audio_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
     await add_cleanup_message(state, message)
     mp3_file = get_mp3_file(message)
+
+    if add_to_beatpack_media_group(message, state, bot, mp3_file):
+        return
 
     if not mp3_file:
         await answer_and_track(
@@ -323,18 +717,13 @@ async def beatpack_audio_handler(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
-    audio_file_id, audio_file_name = mp3_file
-    await state.update_data(
-        pending_audio_file_id=audio_file_id,
-        pending_audio_file_name=audio_file_name,
-    )
-    await cleanup_messages(bot, state, message.chat.id)
-    await state.set_state(BeatpackState.waiting_for_collab_answer)
-    await answer_and_track(
+    await append_tracks(state, [get_track_from_mp3_file(mp3_file)])
+    await show_beatpack_menu(
         message,
         state,
-        "Этот бит коллабный?",
-        reply_markup=get_collab_keyboard(),
+        bot,
+        db_session,
+        message.from_user,
     )
 
 
@@ -344,7 +733,7 @@ async def wrong_beatpack_audio_handler(message: Message, state: FSMContext):
     await answer_and_track(
         message,
         state,
-        "Сейчас нужно отправить mp3-бит.",
+        "Сейчас нужно отправить mp3-биты.",
         reply_markup=get_start_keyboard(),
     )
 
@@ -362,7 +751,7 @@ async def beatpack_collab_yes_handler(callback: CallbackQuery, state: FSMContext
             callback.message,
             state,
             "Отправьте ссылки на авторов через пробел, запятую или с новой строки.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_beatpack_back_button(),
         )
 
 
@@ -370,12 +759,11 @@ async def beatpack_collab_yes_handler(callback: CallbackQuery, state: FSMContext
 async def beatpack_collab_no_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
     await add_cleanup_message(state, callback.message)
-    await state.update_data(pending_authors=[])
+    await update_editing_track(state, authors=[])
 
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
-        await cleanup_messages(bot, state, callback.message.chat.id)
-        await ask_for_file_name(callback.message, state)
+        await show_beatpack_track_action_menu(callback.message, state, bot, "Соавторы убраны.")
 
 
 @router.message(BeatpackState.waiting_for_author_links, F.text)
@@ -388,13 +776,12 @@ async def beatpack_author_links_handler(message: Message, state: FSMContext, bot
             message,
             state,
             "Отправьте хотя бы одну ссылку: https://..., t.me/... или @username.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_beatpack_back_button(),
         )
         return
 
-    await state.update_data(pending_authors=authors)
-    await cleanup_messages(bot, state, message.chat.id)
-    await ask_for_file_name(message, state)
+    await update_editing_track(state, authors=authors)
+    await show_beatpack_track_action_menu(message, state, bot, "Соавторы обновлены.")
 
 
 @router.message(BeatpackState.waiting_for_author_links, is_not_command)
@@ -404,12 +791,17 @@ async def wrong_author_links_handler(message: Message, state: FSMContext):
         message,
         state,
         "Сейчас нужно отправить ссылки на авторов.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_beatpack_back_button(),
     )
 
 
 @router.message(BeatpackState.waiting_for_file_name, F.text, is_not_command)
-async def beatpack_file_name_handler(message: Message, state: FSMContext, bot: Bot):
+async def beatpack_file_name_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
     await add_cleanup_message(state, message)
     file_name = message.text.strip()
 
@@ -418,37 +810,54 @@ async def beatpack_file_name_handler(message: Message, state: FSMContext, bot: B
             message,
             state,
             "Отправьте новое название файла текстом.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_beatpack_back_button(),
         )
         return
 
-    await state.update_data(pending_audio_file_name=file_name)
-    tracks_count = await save_pending_track(state)
+    updated_track_index = await update_editing_track(state, file_name=file_name)
+
+    if updated_track_index is None:
+        await answer_and_track(
+            message,
+            state,
+            "Бит не найден. Вернитесь к битпаку и выберите бит заново.",
+            reply_markup=with_beatpack_back_button(),
+        )
+        return
+
+    await state.update_data(editing_track_index=None)
     await cleanup_messages(bot, state, message.chat.id)
-    await state.set_state(BeatpackState.choosing_next_step)
-    await answer_and_track(
+    await show_beatpack_menu(
         message,
         state,
-        f"Бит добавлен. Всего битов: {tracks_count}.",
-        reply_markup=get_next_step_keyboard(),
+        bot,
+        db_session,
+        message.from_user,
+        "Бит обновлён.",
     )
 
 
 @router.callback_query(BeatpackState.waiting_for_file_name, F.data == "beatpack:file_name:keep")
-async def beatpack_keep_file_name_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+async def beatpack_keep_file_name_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
     await callback.answer()
     await add_cleanup_message(state, callback.message)
 
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
-        tracks_count = await save_pending_track(state)
+        await state.update_data(editing_track_index=None)
         await cleanup_messages(bot, state, callback.message.chat.id)
-        await state.set_state(BeatpackState.choosing_next_step)
-        await answer_and_track(
+        await show_beatpack_menu(
             callback.message,
             state,
-            f"Бит добавлен. Всего битов: {tracks_count}.",
-            reply_markup=get_next_step_keyboard(),
+            bot,
+            db_session,
+            callback.from_user,
+            "Бит обновлён.",
         )
 
 
@@ -459,8 +868,145 @@ async def wrong_beatpack_file_name_handler(message: Message, state: FSMContext):
         message,
         state,
         "Сейчас нужно отправить новое название файла текстом.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_beatpack_back_button(),
     )
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data.startswith("beatpack:edit:"))
+async def beatpack_edit_track_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await add_cleanup_message(state, callback.message)
+
+    if not callback.message:
+        await callback.answer()
+        return
+
+    try:
+        track_index = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Бит не найден.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    tracks = data.get("tracks", [])
+
+    if track_index < 0 or track_index >= len(tracks):
+        await callback.answer("Бит не найден.", show_alert=True)
+        return
+
+    safe_name = get_safe_audio_name(tracks[track_index].get("file_name"), f"beat_{track_index + 1}.mp3")
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(editing_track_index=track_index)
+    await show_beatpack_track_action_menu(callback.message, state, bot, f"Выбран бит «{safe_name}».")
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:track:file_name")
+async def beatpack_track_file_name_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await cleanup_messages(bot, state, callback.message.chat.id)
+        await ask_for_file_name(callback.message, state)
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:track:authors")
+async def beatpack_track_authors_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await cleanup_messages(bot, state, callback.message.chat.id)
+        await state.set_state(BeatpackState.waiting_for_collab_answer)
+        await answer_and_track(
+            callback.message,
+            state,
+            "Этот бит коллабный?",
+            reply_markup=get_collab_keyboard(),
+        )
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data.startswith("beatpack:track:move:"))
+async def beatpack_track_move_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    await add_cleanup_message(state, callback.message)
+    direction = (callback.data or "").rsplit(":", 1)[-1]
+    _, error = await move_editing_track(state, direction)
+
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await show_beatpack_menu(
+            callback.message,
+            state,
+            bot,
+            db_session,
+            callback.from_user,
+            "Порядок обновлён.",
+        )
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:track:delete")
+async def beatpack_track_delete_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    await add_cleanup_message(state, callback.message)
+    deleted = await delete_editing_track(state)
+
+    if not deleted:
+        await callback.answer("Бит не найден.", show_alert=True)
+        return
+
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await show_beatpack_menu(
+            callback.message,
+            state,
+            bot,
+            db_session,
+            callback.from_user,
+            "Бит удалён.",
+        )
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:menu")
+@router.callback_query(BeatpackState.waiting_for_collab_answer, F.data == "beatpack:menu")
+@router.callback_query(BeatpackState.waiting_for_author_links, F.data == "beatpack:menu")
+@router.callback_query(BeatpackState.waiting_for_file_name, F.data == "beatpack:menu")
+async def beatpack_back_to_menu_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await show_beatpack_menu(
+            callback.message,
+            state,
+            bot,
+            db_session,
+            callback.from_user,
+        )
 
 
 @router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:add")
@@ -471,11 +1017,12 @@ async def beatpack_add_more_handler(callback: CallbackQuery, state: FSMContext, 
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
         await cleanup_messages(bot, state, callback.message.chat.id)
+        await state.update_data(editing_track_index=None)
         await state.set_state(BeatpackState.waiting_for_audio)
         await answer_and_track(
             callback.message,
             state,
-            "Отправьте следующий mp3-бит.",
+            "Отправьте mp3-биты для битпака.",
             reply_markup=get_start_keyboard(),
         )
 

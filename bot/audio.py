@@ -1,6 +1,6 @@
+import io
 import logging
 import os
-import tempfile
 
 from aiogram.types import Message
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError
@@ -37,6 +37,13 @@ def prepare_cover_jpeg(cover_path: str, output_path: str) -> None:
     image.save(output_path, format="JPEG", quality=95, optimize=True, progressive=False)
 
 
+def prepare_cover_bytes(cover_path: str) -> bytes:
+    image = open_cover_as_rgb(cover_path)
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=95, optimize=True, progressive=False)
+    return output.getvalue()
+
+
 def create_audio_thumbnail(cover_path: str, thumbnail_path: str) -> None:
     image = open_cover_as_rgb(cover_path)
     image.thumbnail(TELEGRAM_AUDIO_THUMBNAIL_MAX_SIZE, Image.Resampling.LANCZOS)
@@ -61,17 +68,11 @@ def create_audio_thumbnail(cover_path: str, thumbnail_path: str) -> None:
         quality -= TELEGRAM_AUDIO_THUMBNAIL_QUALITY_STEP
 
 
-def add_cover_to_mp3(audio_path: str, cover_path: str) -> None:
+def add_cover_bytes_to_mp3(audio_path: str, cover_data: bytes) -> None:
     try:
         tags = ID3(audio_path)
     except ID3NoHeaderError:
         tags = ID3()
-
-    with tempfile.NamedTemporaryFile(suffix=".jpg") as prepared_cover:
-        prepare_cover_jpeg(cover_path, prepared_cover.name)
-
-        with open(prepared_cover.name, "rb") as cover_file:
-            cover_data = cover_file.read()
 
     tags.delall("APIC")
     tags.add(
@@ -84,6 +85,10 @@ def add_cover_to_mp3(audio_path: str, cover_path: str) -> None:
         )
     )
     tags.save(audio_path, v2_version=3)
+
+
+def add_cover_to_mp3(audio_path: str, cover_path: str) -> None:
+    add_cover_bytes_to_mp3(audio_path, prepare_cover_bytes(cover_path))
 
 
 async def handle_audio(message: Message):
