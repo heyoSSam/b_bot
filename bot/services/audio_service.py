@@ -1,12 +1,15 @@
 import io
 import logging
 import os
+import warnings
 
 from aiogram.types import Message
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from bot.constants import (
+    COVER_MAX_FILE_BYTES,
+    COVER_MAX_PIXELS,
     TELEGRAM_AUDIO_THUMBNAIL_MAX_BYTES,
     TELEGRAM_AUDIO_THUMBNAIL_MAX_SIZE,
     TELEGRAM_AUDIO_THUMBNAIL_MIN_QUALITY,
@@ -17,19 +20,56 @@ from bot.constants import (
 logger = logging.getLogger(__name__)
 
 
+class CoverValidationError(Exception):
+    pass
+
+
+class CoverFileTooLargeError(CoverValidationError):
+    pass
+
+
+class CoverImageTooLargeError(CoverValidationError):
+    pass
+
+
+class CoverImageInvalidError(CoverValidationError):
+    pass
+
+
+def validate_cover_file_size(cover_path: str) -> None:
+    if os.path.getsize(cover_path) > COVER_MAX_FILE_BYTES:
+        raise CoverFileTooLargeError
+
+
 def open_cover_as_rgb(cover_path: str) -> Image.Image:
-    with Image.open(cover_path) as image:
-        image = ImageOps.exif_transpose(image)
+    validate_cover_file_size(cover_path)
 
-        if image.mode in ("RGBA", "LA"):
-            background = Image.new("RGB", image.size, "white")
-            background.paste(image, mask=image.getchannel("A"))
-            return background
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(cover_path) as image:
+                if image.width * image.height > COVER_MAX_PIXELS:
+                    raise CoverImageTooLargeError
 
-        if image.mode != "RGB":
-            return image.convert("RGB")
+                image = ImageOps.exif_transpose(image)
 
-        return image.copy()
+                if image.mode in ("RGBA", "LA"):
+                    background = Image.new("RGB", image.size, "white")
+                    background.paste(image, mask=image.getchannel("A"))
+                    return background
+
+                if image.mode != "RGB":
+                    return image.convert("RGB")
+
+                return image.copy()
+    except CoverImageTooLargeError:
+        raise
+    except CoverFileTooLargeError:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise CoverImageTooLargeError from None
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise CoverImageInvalidError from None
 
 
 def prepare_cover_jpeg(cover_path: str, output_path: str) -> None:

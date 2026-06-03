@@ -4,7 +4,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.constants import DEFAULT_NAME_STYLE
-from bot.models import User
+from bot.db.models import User
 
 
 def get_telegram_tag(telegram_user: TelegramUser) -> str | None:

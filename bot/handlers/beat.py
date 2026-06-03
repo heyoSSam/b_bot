@@ -5,187 +5,84 @@ import tempfile
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.audio import add_cover_to_mp3, create_audio_thumbnail
-from bot.authors import resolve_authors
-from bot.cleanup import add_cleanup_message, answer_and_track, cleanup_messages
-from bot.file_names import (
-    build_file_name_prompt,
-    get_file_name_copy_keyboard,
-    get_safe_audio_name,
+from bot.db.user_storage import get_user, touch_user
+from bot.keyboards.beat import (
+    get_beat_menu_keyboard,
+    get_collab_keyboard,
+    get_cover_keyboard,
+    with_beat_back_button,
 )
-from bot.navigation import get_start_keyboard, with_start_button
-from bot.styles import build_track_caption
-from bot.subscription import is_user_subscribed, require_subscription
-from bot.user_storage import get_user
+from bot.keyboards.common import with_start_button
+from bot.services.audio_service import (
+    add_cover_to_mp3,
+    create_audio_thumbnail,
+)
+from bot.services.author_service import TooManyAuthorsError, resolve_authors_with_limit
+from bot.services.caption_service import build_track_caption
+from bot.services.cleanup_service import add_cleanup_message, answer_and_track, cleanup_messages
+from bot.services.flow_service import (
+    ask_for_author_links as ask_for_author_links_prompt,
+    ask_for_cover as ask_for_cover_prompt,
+    ask_for_file_name as ask_for_file_name_prompt,
+    confirm_subscription,
+    get_cover_file_id,
+    get_mp3_file,
+    handle_build_exception,
+    has_audio_file,
+    has_mp3_file,
+    is_not_command,
+    start_audio_flow,
+)
+from bot.services.subscription_service import require_subscription
+from bot.states.beat import BeatState
+from bot.constants import (
+    AUTHOR_LIMIT_EXCEEDED_TEXT,
+    MAX_TRACK_AUTHORS,
+)
+from bot.utils.file_names import get_safe_audio_name
 
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 
-class BeatState(StatesGroup):
-    waiting_for_audio = State()
-    choosing_next_step = State()
-    waiting_for_collab_answer = State()
-    waiting_for_author_links = State()
-    waiting_for_file_name = State()
-    waiting_for_cover = State()
-
-
-def with_beat_back_button(reply_markup: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
-    inline_keyboard = []
-
-    if reply_markup:
-        inline_keyboard.extend(reply_markup.inline_keyboard)
-
-    inline_keyboard.append(
-        [
-            InlineKeyboardButton(
-                text="Вернуться к биту",
-                callback_data="beat:menu",
-            )
-        ]
-    )
-
-    return with_start_button(InlineKeyboardMarkup(inline_keyboard=inline_keyboard))
-
-
-def get_collab_keyboard() -> InlineKeyboardMarkup:
-    return with_beat_back_button(
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Да", callback_data="beat:collab:yes"),
-                    InlineKeyboardButton(text="Нет", callback_data="beat:collab:no"),
-                ]
-            ]
-        )
-    )
-
-
-def get_beat_menu_keyboard(has_cover: bool) -> InlineKeyboardMarkup:
-    cover_button_text = "Заменить обложку" if has_cover else "Добавить обложку"
-    return with_start_button(
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Собрать сейчас", callback_data="beat:build")],
-                [
-                    InlineKeyboardButton(text="Переименовать", callback_data="beat:file_name"),
-                    InlineKeyboardButton(text="Соавторы", callback_data="beat:authors"),
-                ],
-                [InlineKeyboardButton(text=cover_button_text, callback_data="beat:cover")],
-            ]
-        )
-    )
-
-
-def get_cover_keyboard() -> InlineKeyboardMarkup:
-    return with_beat_back_button(
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Без обложки", callback_data="beat:cover:skip")]
-            ]
-        )
-    )
-
-
-async def ask_for_author_links(message: Message, state: FSMContext, notice: str | None = None):
-    text = "Отправьте ссылки на авторов через пробел, запятую или с новой строки."
-
-    if notice:
-        text = f"{notice}\n\n{text}"
-
-    await state.set_state(BeatState.waiting_for_author_links)
-    await answer_and_track(
-        message,
-        state,
-        text,
-        reply_markup=with_beat_back_button(),
-    )
-
-
-def is_not_command(message: Message) -> bool:
-    return not (message.text and message.text.startswith("/"))
-
-
-def get_mp3_file(message: Message) -> tuple[str, str] | None:
-    if message.audio:
-        file_name = message.audio.file_name or "beat.mp3"
-
-        if (
-            file_name.lower().endswith(".mp3")
-            or message.audio.mime_type in ("audio/mpeg", "audio/mp3")
-        ):
-            return message.audio.file_id, file_name
-
-        return None
-
-    if message.document:
-        file_name = message.document.file_name or "beat.mp3"
-
-        if (
-            file_name.lower().endswith(".mp3")
-            or message.document.mime_type in ("audio/mpeg", "audio/mp3")
-        ):
-            return message.document.file_id, file_name
-
-    return None
-
-
-def has_audio_file(message: Message) -> bool:
-    return bool(message.audio or message.document)
-
-
-def has_mp3_file(message: Message) -> bool:
-    return get_mp3_file(message) is not None
-
-
-def get_cover_file_id(message: Message) -> str | None:
-    if message.photo:
-        return message.photo[-1].file_id
-
-    if message.document and message.document.mime_type in ("image/jpeg", "image/png"):
-        return message.document.file_id
-
-    return None
-
-
 async def ask_for_cover(message: Message, state: FSMContext):
-    await state.set_state(BeatState.waiting_for_cover)
-    await answer_and_track(
+    await ask_for_cover_prompt(
         message,
         state,
+        BeatState.waiting_for_cover,
         "Теперь отправьте обложку или нажмите «Без обложки».",
-        reply_markup=get_cover_keyboard(),
+        get_cover_keyboard(),
     )
 
 
 async def ask_for_file_name(message: Message, state: FSMContext):
     data = await state.get_data()
-    audio_file_name = get_safe_audio_name(data.get("audio_file_name"), "beat.mp3")
-
-    await state.set_state(BeatState.waiting_for_file_name)
-    await answer_and_track(
+    await ask_for_file_name_prompt(
         message,
         state,
-        build_file_name_prompt(audio_file_name),
-        reply_markup=with_beat_back_button(
-            get_file_name_copy_keyboard(
-                audio_file_name,
-                keep_callback_data="beat:file_name:keep",
-            )
-        ),
-        parse_mode="HTML",
+        BeatState.waiting_for_file_name,
+        data.get("audio_file_name"),
+        "beat.mp3",
+        with_beat_back_button,
+        "beat:file_name:keep",
+    )
+
+
+async def ask_for_author_links(message: Message, state: FSMContext, notice: str | None = None):
+    await ask_for_author_links_prompt(
+        message,
+        state,
+        BeatState.waiting_for_author_links,
+        with_beat_back_button(),
+        notice=notice,
     )
 
 
@@ -223,7 +120,7 @@ async def accept_beat_audio(message: Message, state: FSMContext, bot: Bot) -> No
             message,
             state,
             "Пока поддерживаются только mp3-файлы.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -279,57 +176,56 @@ async def build_and_send_beat(
 
             await cleanup_messages(bot, state, message.chat.id)
             await message.answer_audio(**audio_kwargs)
-    except Exception:
-        logger.exception("Failed to build beat")
-        await cleanup_messages(bot, state, message.chat.id)
-        await state.clear()
-        await message.answer(
+            if telegram_user:
+                await touch_user(db_session, telegram_user)
+    except Exception as error:
+        await handle_build_exception(
+            message,
+            state,
+            bot,
+            error,
+            logger,
+            "Failed to build beat",
             "Не удалось собрать бит. Попробуйте снова через /beat.",
-            reply_markup=get_start_keyboard(),
         )
         return
 
     await state.clear()
+
+
+async def start_beat_flow(message: Message, state: FSMContext, bot: Bot) -> None:
+    await start_audio_flow(
+        message,
+        state,
+        bot,
+        "beat",
+        BeatState.waiting_for_audio,
+        "Отправьте mp3-бит.",
+    )
 
 
 @router.message(Command("beat"))
 async def start_beat(message: Message, state: FSMContext, bot: Bot):
-    await cleanup_messages(bot, state, message.chat.id)
-    await state.clear()
-    await add_cleanup_message(state, message)
+    await start_beat_flow(message, state, bot)
 
-    if not await require_subscription(message, bot, "beat"):
-        return
 
-    await state.set_state(BeatState.waiting_for_audio)
-    await answer_and_track(
-        message,
-        state,
-        "Отправьте mp3-бит.",
-        reply_markup=get_start_keyboard(),
-    )
+@router.callback_query(F.data == "start:beat")
+async def start_beat_from_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+
+    if callback.message:
+        await start_beat_flow(callback.message, state, bot)
 
 
 @router.callback_query(F.data == "subscription:check:beat")
 async def check_beat_subscription(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    if not await is_user_subscribed(bot, callback.from_user.id):
-        await callback.answer("Подписка не найдена.", show_alert=True)
-        return
-
-    await callback.answer()
-
-    if callback.message:
-        await cleanup_messages(bot, state, callback.message.chat.id)
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await state.clear()
-        await add_cleanup_message(state, callback.message)
-        await state.set_state(BeatState.waiting_for_audio)
-        await answer_and_track(
-            callback.message,
-            state,
-            "Подписка подтверждена. Отправьте mp3-бит.",
-            reply_markup=get_start_keyboard(),
-        )
+    await confirm_subscription(
+        callback,
+        state,
+        bot,
+        BeatState.waiting_for_audio,
+        "Подписка подтверждена. Отправьте mp3-бит.",
+    )
 
 
 @router.message(StateFilter(None), has_mp3_file)
@@ -357,7 +253,7 @@ async def wrong_beat_audio_handler(message: Message, state: FSMContext):
         message,
         state,
         "Сейчас нужно отправить mp3-бит.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -446,7 +342,16 @@ async def beat_collab_no_handler(callback: CallbackQuery, state: FSMContext, bot
 @router.message(BeatState.waiting_for_author_links, F.text)
 async def beat_author_links_handler(message: Message, state: FSMContext, bot: Bot):
     await add_cleanup_message(state, message)
-    authors = await resolve_authors(bot, message.text)
+
+    try:
+        authors = await resolve_authors_with_limit(bot, message.text, MAX_TRACK_AUTHORS)
+    except TooManyAuthorsError:
+        await ask_for_author_links(
+            message,
+            state,
+            AUTHOR_LIMIT_EXCEEDED_TEXT.format(max_authors=MAX_TRACK_AUTHORS),
+        )
+        return
 
     if not authors:
         await ask_for_author_links(

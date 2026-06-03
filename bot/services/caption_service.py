@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 from aiogram.types import Message, User as TelegramUser
 
 from bot.constants import BOT_CREDIT_TEXT, DEFAULT_NAME_STYLE, NAME_STYLE_TOKEN_PATTERN
-from bot.models import User
+from bot.db.models import User
 
 
 name_style_token_pattern = re.compile(NAME_STYLE_TOKEN_PATTERN)

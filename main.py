@@ -1,5 +1,5 @@
-import asyncio 
-import os 
+import asyncio
+import os
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, Message
@@ -9,15 +9,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from bot.beat import router as beat_router
-from bot.beatpack import router as beatpack_router
-from bot.cleanup import add_cleanup_message, answer_and_track
-from bot.constants import START_GUIDE_TEXT
-from bot.database import async_session, close_db, init_db
-from bot.middleware import DatabaseMiddleware
-from bot.navigation import router as navigation_router
-from bot.settings import router as settings_router
-from bot.unknown import router as unknown_router
+from bot.db.session import async_session, close_db, init_db
+from bot.handlers.beat import router as beat_router
+from bot.handlers.beatpack import router as beatpack_router
+from bot.handlers.navigation import router as navigation_router, send_start_screen
+from bot.handlers.settings import router as settings_router
+from bot.handlers.unknown import router as unknown_router
+from bot.infra.middleware import DatabaseMiddleware
+from bot.services.cleanup_service import add_cleanup_message
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +38,7 @@ async def start(message: Message, state: FSMContext):
     logger.info(f"User {message.from_user.id} started the bot.")
     await state.clear()
     await add_cleanup_message(state, message)
-    await answer_and_track(message, state, START_GUIDE_TEXT)
+    await send_start_screen(message, state)
 
 async def main():
     logger.info("Starting bot...")

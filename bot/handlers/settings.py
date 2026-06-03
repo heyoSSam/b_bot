@@ -5,18 +5,25 @@ from urllib.parse import urlparse, urlunparse
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     LinkPreviewOptions,
     Message,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.authors import resolve_author
-from bot.cleanup import add_cleanup_message, answer_and_track, cleanup_messages
+from bot.db.user_storage import get_user, set_user_channel, set_user_name_style
+from bot.keyboards.common import with_start_button
+from bot.keyboards.settings import (
+    get_style_co_author_keyboard,
+    get_style_constructor_keyboard,
+    get_style_me_keyboard,
+)
+from bot.services.author_service import resolve_author
+from bot.services.caption_service import build_track_caption_for_style, get_channel_label
+from bot.services.cleanup_service import add_cleanup_message, answer_and_track, cleanup_messages
+from bot.services.subscription_service import get_channel_url, get_required_channel_value
+from bot.states.settings import SettingsState
 from bot.constants import (
     DEFAULT_NAME_STYLE,
     NAME_STYLE_MAX_LENGTH,
@@ -29,26 +36,10 @@ from bot.constants import (
     SET_STYLE_RAW_INPUT_PROMPT,
     SET_STYLE_RAW_INPUT_WITHOUT_CHANNEL_PROMPT,
     SET_STYLE_TEXT_INPUT_PROMPT,
-    START_GUIDE_TEXT,
 )
-from bot.navigation import get_start_keyboard
-from bot.styles import build_track_caption_for_style, get_channel_label
-from bot.subscription import get_channel_url, get_required_channel_value
-from bot.user_storage import get_user, set_user_channel, set_user_name_style
 
 
 router = Router()
-
-
-class SettingsState(StatesGroup):
-    waiting_for_channel = State()
-    editing_style = State()
-    choosing_style_me = State()
-    choosing_style_co_author = State()
-    waiting_for_style = State()
-    waiting_for_style_me_text = State()
-    waiting_for_style_co_author_text = State()
-    waiting_for_style_text = State()
 
 
 def is_not_command(message: Message) -> bool:
@@ -135,73 +126,6 @@ def add_trailing_space(value: str) -> str:
     return value if value.endswith(" ") else f"{value} "
 
 
-def get_style_constructor_keyboard(has_channel: bool = False) -> InlineKeyboardMarkup:
-    first_row = [
-        InlineKeyboardButton(text="Добавить ЛС", callback_data="settings:style:add_me"),
-    ]
-
-    if has_channel:
-        first_row.append(
-            InlineKeyboardButton(text="Добавить канал", callback_data="settings:style:add_channel")
-        )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            first_row,
-            [
-                InlineKeyboardButton(text="Добавить соавторов", callback_data="settings:style:add_co_author"),
-                InlineKeyboardButton(text="Добавить текст", callback_data="settings:style:add_text"),
-            ],
-            [
-                InlineKeyboardButton(text="Предпросмотр", callback_data="settings:style:preview"),
-                InlineKeyboardButton(text="Сохранить", callback_data="settings:style:save"),
-            ],
-            [
-                InlineKeyboardButton(text="Отменить шаг", callback_data="settings:style:undo"),
-                InlineKeyboardButton(text="Очистить", callback_data="settings:style:clear"),
-            ],
-            [
-                InlineKeyboardButton(text="Ввести шаблон вручную", callback_data="settings:style:manual"),
-            ],
-            [
-                InlineKeyboardButton(text="В старт", callback_data="navigation:start"),
-            ],
-        ]
-    )
-
-
-def get_style_me_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Username", callback_data="settings:style:me_username"),
-                InlineKeyboardButton(text="Свой текст", callback_data="settings:style:me_custom"),
-            ],
-            [
-                InlineKeyboardButton(text="Назад", callback_data="settings:style:back"),
-            ],
-            [
-                InlineKeyboardButton(text="В старт", callback_data="navigation:start"),
-            ],
-        ]
-    )
-
-
-def get_style_co_author_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Свой текст", callback_data="settings:style:co_author_custom"),
-                InlineKeyboardButton(text="Без текста", callback_data="settings:style:co_author_empty"),
-            ],
-            [
-                InlineKeyboardButton(text="Назад", callback_data="settings:style:back"),
-            ],
-            [
-                InlineKeyboardButton(text="В старт", callback_data="navigation:start"),
-            ],
-        ]
-    )
 
 
 def build_style_constructor_text(style: str, notice: str | None = None) -> str:
@@ -325,22 +249,26 @@ async def save_channel(
             message,
             state,
             "Не понял ссылку. Отправьте @channel или https://t.me/channel.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
     await set_user_channel(db_session, message.from_user, channel_url)
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
-    await message.answer(f"Канал сохранён: {channel_url}\n\n{START_GUIDE_TEXT}")
+    await answer_and_track(
+        message,
+        state,
+        f"Канал сохранён: {channel_url}",
+        reply_markup=with_start_button(),
+    )
 
 
-@router.message(Command("set_channel"))
-async def start_set_channel(
+async def start_set_channel_flow(
     message: Message,
     state: FSMContext,
     bot: Bot,
-):
+) -> None:
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
     await add_cleanup_message(state, message)
@@ -350,8 +278,25 @@ async def start_set_channel(
         state,
         SET_CHANNEL_GUIDE_TEXT,
         parse_mode="HTML",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
+
+
+@router.message(Command("set_channel"))
+async def start_set_channel(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    await start_set_channel_flow(message, state, bot)
+
+
+@router.callback_query(F.data == "start:set_channel")
+async def start_set_channel_from_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+
+    if callback.message:
+        await start_set_channel_flow(callback.message, state, bot)
 
 
 @router.message(SettingsState.waiting_for_channel, F.text, is_not_command)
@@ -364,13 +309,12 @@ async def set_channel_handler(
     await save_channel(message, state, bot, db_session, message.text)
 
 
-@router.message(Command("set_style"))
-async def start_set_style(
+async def start_set_style_flow(
     message: Message,
     state: FSMContext,
     bot: Bot,
     db_session: AsyncSession,
-):
+) -> None:
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
     await add_cleanup_message(state, message)
@@ -385,6 +329,29 @@ async def start_set_style(
         style_history=[],
     )
     await send_style_constructor(message, state, style)
+
+
+@router.message(Command("set_style"))
+async def start_set_style(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    await start_set_style_flow(message, state, bot, db_session)
+
+
+@router.callback_query(F.data == "start:set_style")
+async def start_set_style_from_menu(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    await callback.answer()
+
+    if callback.message:
+        await start_set_style_flow(callback.message, state, bot, db_session)
 
 
 @router.callback_query(SettingsState.editing_style, F.data == "settings:style:add_me")
@@ -431,7 +398,7 @@ async def start_custom_me_text(callback: CallbackQuery, state: FSMContext, bot: 
         callback.message,
         state,
         SET_STYLE_ME_TEXT_INPUT_PROMPT,
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -494,7 +461,7 @@ async def start_custom_co_author_text(callback: CallbackQuery, state: FSMContext
         callback.message,
         state,
         SET_STYLE_CO_AUTHOR_TEXT_INPUT_PROMPT,
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -526,7 +493,7 @@ async def start_add_style_text(callback: CallbackQuery, state: FSMContext, bot: 
         callback.message,
         state,
         SET_STYLE_TEXT_INPUT_PROMPT,
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -545,7 +512,7 @@ async def start_manual_style_input(callback: CallbackQuery, state: FSMContext, b
         state,
         await get_style_raw_input_prompt(state),
         parse_mode="HTML",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -641,7 +608,12 @@ async def save_style_draft(
     await state.clear()
 
     if callback.message:
-        await callback.message.answer(f"Шаблон подписи сохранён.\n\n{START_GUIDE_TEXT}")
+        await answer_and_track(
+            callback.message,
+            state,
+            "Шаблон подписи сохранён.",
+            reply_markup=with_start_button(),
+        )
 
 
 @router.message(SettingsState.waiting_for_style, F.text, is_not_command)
@@ -660,7 +632,7 @@ async def set_style_handler(
             state,
             get_name_style_validation_error(message.text, has_channel)
             or f"Отправьте непустой шаблон до {NAME_STYLE_MAX_LENGTH} символов.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -685,7 +657,7 @@ async def add_style_text_handler(message: Message, state: FSMContext, bot: Bot):
             message,
             state,
             "Отправьте непустой текст для добавления в шаблон.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -698,7 +670,7 @@ async def add_style_text_handler(message: Message, state: FSMContext, bot: Bot):
             message,
             state,
             error,
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -718,7 +690,7 @@ async def add_style_me_text_handler(message: Message, state: FSMContext, bot: Bo
             message,
             state,
             "Отправьте непустой текст для ссылки.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -731,7 +703,7 @@ async def add_style_me_text_handler(message: Message, state: FSMContext, bot: Bo
             message,
             state,
             error,
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -751,7 +723,7 @@ async def add_style_co_author_text_handler(message: Message, state: FSMContext, 
             message,
             state,
             "Отправьте непустой текст перед соавторами.",
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -764,7 +736,7 @@ async def add_style_co_author_text_handler(message: Message, state: FSMContext, 
             message,
             state,
             error,
-            reply_markup=get_start_keyboard(),
+            reply_markup=with_start_button(),
         )
         return
 
@@ -781,7 +753,7 @@ async def wrong_manual_style_input(message: Message, state: FSMContext):
         message,
         state,
         "Отправьте шаблон текстом.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -792,7 +764,7 @@ async def wrong_style_text_input(message: Message, state: FSMContext):
         message,
         state,
         "Отправьте текст, который нужно добавить в шаблон.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -803,7 +775,7 @@ async def wrong_style_me_text_input(message: Message, state: FSMContext):
         message,
         state,
         "Отправьте текст для ссылки на личные сообщения.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -814,7 +786,7 @@ async def wrong_style_co_author_text_input(message: Message, state: FSMContext):
         message,
         state,
         "Отправьте текст перед соавторами.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -825,7 +797,7 @@ async def wrong_style_me_choice(message: Message, state: FSMContext):
         message,
         state,
         "Выберите вариант кнопкой.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -836,7 +808,7 @@ async def wrong_style_co_author_choice(message: Message, state: FSMContext):
         message,
         state,
         "Выберите вариант кнопкой.",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )
 
 
@@ -847,5 +819,5 @@ async def wrong_style_constructor_input(message: Message, state: FSMContext):
         message,
         state,
         "Используйте кнопки конструктора или выберите «Ввести шаблон вручную».",
-        reply_markup=get_start_keyboard(),
+        reply_markup=with_start_button(),
     )

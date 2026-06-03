@@ -7,7 +7,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.constants import SUBSCRIPTION_REQUIRED_TEXT
-from bot.navigation import with_start_button
+from bot.keyboards.common import with_start_button
 
 
 logger = logging.getLogger(__name__)

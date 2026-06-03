@@ -5,6 +5,10 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
 
+class TooManyAuthorsError(Exception):
+    pass
+
+
 def split_author_tokens(text: str) -> list[str]:
     return [
         token.strip(" ,;\n\t")
@@ -87,16 +91,32 @@ async def resolve_author(bot: Bot, value: str) -> dict[str, str] | None:
 
 
 async def resolve_authors(bot: Bot, text: str) -> list[dict[str, str]]:
+    return await resolve_authors_with_limit(bot, text)
+
+
+async def resolve_authors_with_limit(
+    bot: Bot,
+    text: str,
+    max_authors: int | None = None,
+) -> list[dict[str, str]]:
     authors = []
     seen_urls = set()
 
     for token in split_author_tokens(text):
-        author = await resolve_author(bot, token)
+        url = normalize_author_url(token)
 
-        if not author or author["url"] in seen_urls:
+        if not url or url in seen_urls:
+            continue
+
+        if max_authors is not None and len(seen_urls) >= max_authors:
+            raise TooManyAuthorsError
+
+        author = await resolve_author(bot, url)
+
+        if not author:
             continue
 
         authors.append(author)
-        seen_urls.add(author["url"])
+        seen_urls.add(url)
 
     return authors

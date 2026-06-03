@@ -5,8 +5,6 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from bot.user_storage import touch_user
-
 
 class DatabaseMiddleware(BaseMiddleware):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -20,10 +18,6 @@ class DatabaseMiddleware(BaseMiddleware):
     ) -> Any:
         async with self.session_factory() as session:
             data["db_session"] = session
-            telegram_user = data.get("event_from_user")
-
-            if telegram_user and not telegram_user.is_bot:
-                await touch_user(session, telegram_user)
 
             try:
                 result = await handler(event, data)

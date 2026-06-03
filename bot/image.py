@@ -5,7 +5,7 @@ import tempfile
 from aiogram import Bot
 from aiogram.types import FSInputFile, Message
 
-from bot.audio import add_cover_to_mp3
+from bot.services.audio_service import add_cover_to_mp3
 
 
 logger = logging.getLogger(__name__)
