@@ -13,7 +13,7 @@ from bot.db.session import async_session, close_db, init_db
 from bot.handlers.beat import router as beat_router
 from bot.handlers.beatpack import router as beatpack_router
 from bot.handlers.navigation import router as navigation_router, send_start_screen
-from bot.handlers.settings import router as settings_router
+from bot.handlers.settings import router as settings_router, start_registration_if_needed
 from bot.handlers.unknown import router as unknown_router
 from bot.infra.middleware import DatabaseMiddleware
 from bot.services.cleanup_service import add_cleanup_message
@@ -34,8 +34,12 @@ dp.include_router(navigation_router)
 dp.include_router(unknown_router)
 
 @dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
+async def start(message: Message, state: FSMContext, db_session, bot: Bot):
     logger.info(f"User {message.from_user.id} started the bot.")
+
+    if await start_registration_if_needed(message, state, bot, db_session):
+        return
+
     await state.clear()
     await add_cleanup_message(state, message)
     await send_start_screen(message, state)

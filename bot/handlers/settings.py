@@ -12,7 +12,7 @@ from aiogram.types import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.user_storage import get_user, set_user_channel, set_user_name_style
+from bot.db.user_storage import get_user, set_user_channel, set_user_name_style, touch_user
 from bot.keyboards.common import with_start_button
 from bot.keyboards.settings import (
     get_style_co_author_keyboard,
@@ -22,12 +22,18 @@ from bot.keyboards.settings import (
 from bot.services.author_service import resolve_author
 from bot.services.caption_service import build_track_caption_for_style, get_channel_label
 from bot.services.cleanup_service import add_cleanup_message, answer_and_track, cleanup_messages
-from bot.services.subscription_service import get_channel_url, get_required_channel_value
+from bot.services.subscription_service import (
+    get_channel_url,
+    get_required_channel_value,
+    is_user_subscribed,
+    require_subscription,
+)
 from bot.states.settings import SettingsState
 from bot.constants import (
     DEFAULT_NAME_STYLE,
     NAME_STYLE_MAX_LENGTH,
     NAME_STYLE_TOKEN_PATTERN,
+    ONBOARDING_CHANNEL_GUIDE_TEXT,
     SET_CHANNEL_GUIDE_TEXT,
     SET_STYLE_CO_AUTHOR_TEXT_INPUT_PROMPT,
     SET_STYLE_CONSTRUCTOR_TEXT,
@@ -37,6 +43,7 @@ from bot.constants import (
     SET_STYLE_RAW_INPUT_WITHOUT_CHANNEL_PROMPT,
     SET_STYLE_TEXT_INPUT_PROMPT,
 )
+from bot.handlers.navigation import send_start_screen
 
 
 router = Router()
@@ -254,8 +261,22 @@ async def save_channel(
         return
 
     await set_user_channel(db_session, message.from_user, channel_url)
+    data = await state.get_data()
+    is_registration = bool(data.get("registration_flow"))
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
+
+    if is_registration:
+        await start_set_style_flow(
+            message,
+            state,
+            bot,
+            db_session,
+            is_registration=True,
+            notice=f"Канал сохранён: {channel_url}. Теперь настройте шаблон подписи.",
+        )
+        return
+
     await answer_and_track(
         message,
         state,
@@ -268,18 +289,45 @@ async def start_set_channel_flow(
     message: Message,
     state: FSMContext,
     bot: Bot,
+    is_registration: bool = False,
 ) -> None:
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
     await add_cleanup_message(state, message)
     await state.set_state(SettingsState.waiting_for_channel)
+    await state.update_data(registration_flow=is_registration)
     await answer_and_track(
         message,
         state,
-        SET_CHANNEL_GUIDE_TEXT,
+        ONBOARDING_CHANNEL_GUIDE_TEXT if is_registration else SET_CHANNEL_GUIDE_TEXT,
         parse_mode="HTML",
         reply_markup=with_start_button(),
     )
+
+
+async def start_registration_if_needed(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+) -> bool:
+    telegram_user = message.from_user
+
+    if not telegram_user:
+        return False
+
+    user = await get_user(db_session, telegram_user.id)
+
+    if user:
+        return False
+
+    await touch_user(db_session, telegram_user)
+
+    if not await require_subscription(message, bot, "onboarding"):
+        return True
+
+    await start_set_channel_flow(message, state, bot, is_registration=True)
+    return True
 
 
 @router.message(Command("set_channel"))
@@ -287,7 +335,11 @@ async def start_set_channel(
     message: Message,
     state: FSMContext,
     bot: Bot,
+    db_session: AsyncSession,
 ):
+    if await start_registration_if_needed(message, state, bot, db_session):
+        return
+
     await start_set_channel_flow(message, state, bot)
 
 
@@ -314,6 +366,8 @@ async def start_set_style_flow(
     state: FSMContext,
     bot: Bot,
     db_session: AsyncSession,
+    is_registration: bool = False,
+    notice: str | None = None,
 ) -> None:
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
@@ -327,8 +381,9 @@ async def start_set_style_flow(
         style_draft=style,
         style_has_channel=has_channel,
         style_history=[],
+        registration_flow=is_registration,
     )
-    await send_style_constructor(message, state, style)
+    await send_style_constructor(message, state, style, notice)
 
 
 @router.message(Command("set_style"))
@@ -338,7 +393,23 @@ async def start_set_style(
     bot: Bot,
     db_session: AsyncSession,
 ):
+    if await start_registration_if_needed(message, state, bot, db_session):
+        return
+
     await start_set_style_flow(message, state, bot, db_session)
+
+
+@router.callback_query(F.data == "subscription:check:onboarding")
+async def check_onboarding_subscription(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await is_user_subscribed(bot, callback.from_user.id):
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await start_set_channel_flow(callback.message, state, bot, is_registration=True)
 
 
 @router.callback_query(F.data == "start:set_style")
@@ -592,6 +663,8 @@ async def save_style_draft(
     db_session: AsyncSession,
 ):
     style = await get_style_draft(state)
+    data = await state.get_data()
+    is_registration = bool(data.get("registration_flow"))
     error = get_name_style_validation_error(style, await get_style_has_channel(state))
 
     if error:
@@ -608,6 +681,14 @@ async def save_style_draft(
     await state.clear()
 
     if callback.message:
+        if is_registration:
+            await send_start_screen(
+                callback.message,
+                state,
+                "Регистрация завершена. Теперь можно пользоваться ботом.",
+            )
+            return
+
         await answer_and_track(
             callback.message,
             state,

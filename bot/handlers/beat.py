@@ -13,6 +13,7 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.user_storage import get_user, touch_user
+from bot.handlers.settings import start_registration_if_needed
 from bot.keyboards.beat import (
     get_beat_menu_keyboard,
     get_collab_keyboard,
@@ -205,7 +206,10 @@ async def start_beat_flow(message: Message, state: FSMContext, bot: Bot) -> None
 
 
 @router.message(Command("beat"))
-async def start_beat(message: Message, state: FSMContext, bot: Bot):
+async def start_beat(message: Message, state: FSMContext, bot: Bot, db_session: AsyncSession):
+    if await start_registration_if_needed(message, state, bot, db_session):
+        return
+
     await start_beat_flow(message, state, bot)
 
 
@@ -229,7 +233,15 @@ async def check_beat_subscription(callback: CallbackQuery, state: FSMContext, bo
 
 
 @router.message(StateFilter(None), has_mp3_file)
-async def direct_beat_audio_handler(message: Message, state: FSMContext, bot: Bot):
+async def direct_beat_audio_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    if await start_registration_if_needed(message, state, bot, db_session):
+        return
+
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
     await add_cleanup_message(state, message)

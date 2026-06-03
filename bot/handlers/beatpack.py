@@ -17,6 +17,7 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.user_storage import get_user, touch_user
+from bot.handlers.settings import start_registration_if_needed
 from bot.keyboards.beatpack import (
     get_beatpack_menu_keyboard,
     get_beatpack_track_action_keyboard,
@@ -571,7 +572,15 @@ async def start_beatpack_flow(message: Message, state: FSMContext, bot: Bot) -> 
 
 
 @router.message(Command("beatpack"))
-async def start_beatpack(message: Message, state: FSMContext, bot: Bot):
+async def start_beatpack(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    if await start_registration_if_needed(message, state, bot, db_session):
+        return
+
     await start_beatpack_flow(message, state, bot)
 
 

@@ -7,6 +7,18 @@ START_GUIDE_TEXT = """Привет!
 Автор: @wilddogslivelong
 """
 
+ONBOARDING_CHANNEL_GUIDE_TEXT = """Добро пожаловать!
+
+Сначала сохраните ссылку на ваш Telegram-канал.
+
+Можно так:
+
+<code>@channel</code>
+
+<code>https://t.me/channel</code>
+
+После этого перейдём к настройке шаблона подписи."""
+
 BOT_CREDIT_TEXT = "оформление сделано через @FormatterBeatBot"
 
 DEFAULT_NAME_STYLE = "{me}"
