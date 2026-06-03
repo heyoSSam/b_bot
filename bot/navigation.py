@@ -3,7 +3,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.cleanup import cleanup_messages
+from bot.cleanup import answer_and_track, cleanup_messages
 from bot.constants import START_GUIDE_TEXT
 
 
@@ -51,4 +51,4 @@ async def go_to_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
         pass
 
     await state.clear()
-    await callback.message.answer(START_GUIDE_TEXT)
+    await answer_and_track(callback.message, state, START_GUIDE_TEXT)

@@ -10,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    CopyTextButton,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -74,6 +75,44 @@ def get_collab_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def get_recent_authors(data: dict) -> list[dict[str, str]]:
+    authors = data.get("recent_authors", [])
+
+    if not isinstance(authors, list):
+        return []
+
+    return [
+        {"label": author["label"], "url": author["url"]}
+        for author in authors
+        if isinstance(author, dict) and author.get("label") and author.get("url")
+    ]
+
+
+def get_recent_authors_keyboard(authors: list[dict[str, str]]) -> InlineKeyboardMarkup | None:
+    if not authors:
+        return None
+
+    inline_keyboard = []
+    row = []
+
+    for author in authors:
+        row.append(
+            InlineKeyboardButton(
+                text=author["label"],
+                copy_text=CopyTextButton(text=author["url"]),
+            )
+        )
+
+        if len(row) == 2:
+            inline_keyboard.append(row)
+            row = []
+
+    if row:
+        inline_keyboard.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+
 def get_beatpack_menu_keyboard(tracks: list[dict]) -> InlineKeyboardMarkup:
     inline_keyboard = [
         [
@@ -108,17 +147,41 @@ def get_beatpack_track_action_keyboard() -> InlineKeyboardMarkup:
                     InlineKeyboardButton(text="Соавторы", callback_data="beatpack:track:authors"),
                 ],
                 [
-                    InlineKeyboardButton(text="Вверх", callback_data="beatpack:track:move:up"),
-                    InlineKeyboardButton(text="Вниз", callback_data="beatpack:track:move:down"),
-                ],
-                [
-                    InlineKeyboardButton(text="В начало", callback_data="beatpack:track:move:first"),
-                    InlineKeyboardButton(text="В конец", callback_data="beatpack:track:move:last"),
+                    InlineKeyboardButton(
+                        text="Изменить позицию",
+                        callback_data="beatpack:track:move",
+                    ),
                 ],
                 [InlineKeyboardButton(text="Удалить", callback_data="beatpack:track:delete")],
             ]
         )
     )
+
+
+def get_beatpack_track_position_keyboard(tracks_count: int) -> InlineKeyboardMarkup:
+    inline_keyboard = []
+
+    for start_index in range(0, tracks_count, 5):
+        inline_keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=str(position),
+                    callback_data=f"beatpack:track:position:{position - 1}",
+                )
+                for position in range(start_index + 1, min(start_index + 6, tracks_count + 1))
+            ]
+        )
+
+    inline_keyboard.append(
+        [
+            InlineKeyboardButton(
+                text="Вернуться к биту",
+                callback_data="beatpack:track:actions",
+            )
+        ]
+    )
+
+    return with_beatpack_back_button(InlineKeyboardMarkup(inline_keyboard=inline_keyboard))
 
 
 def with_beatpack_back_button(reply_markup: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
@@ -191,7 +254,24 @@ async def update_editing_track(state: FSMContext, **values) -> int | None:
     return track_index
 
 
-async def move_editing_track(state: FSMContext, direction: str) -> tuple[int | None, str | None]:
+async def update_recent_authors(state: FSMContext, authors: list[dict[str, str]]) -> None:
+    data = await state.get_data()
+    recent_authors = get_recent_authors(data)
+    authors_by_url = {author["url"]: author for author in recent_authors}
+
+    for author in authors:
+        url = author.get("url")
+        label = author.get("label")
+
+        if not url or not label:
+            continue
+
+        authors_by_url[url] = {"label": label, "url": url}
+
+    await state.update_data(recent_authors=list(authors_by_url.values()))
+
+
+async def move_editing_track(state: FSMContext, target_index: int) -> tuple[int | None, str | None]:
     data = await state.get_data()
     track_index, track = get_indexed_track(data)
     tracks = list(data.get("tracks", []))
@@ -199,34 +279,15 @@ async def move_editing_track(state: FSMContext, direction: str) -> tuple[int | N
     if track_index is None or track is None:
         return None, "Бит не найден."
 
-    if direction == "up":
-        if track_index == 0:
-            return track_index, "Бит уже на первом месте."
-
-        tracks[track_index - 1], tracks[track_index] = tracks[track_index], tracks[track_index - 1]
-        track_index -= 1
-    elif direction == "down":
-        if track_index == len(tracks) - 1:
-            return track_index, "Бит уже на последнем месте."
-
-        tracks[track_index + 1], tracks[track_index] = tracks[track_index], tracks[track_index + 1]
-        track_index += 1
-    elif direction == "first":
-        if track_index == 0:
-            return track_index, "Бит уже на первом месте."
-
-        tracks.pop(track_index)
-        tracks.insert(0, track)
-        track_index = 0
-    elif direction == "last":
-        if track_index == len(tracks) - 1:
-            return track_index, "Бит уже на последнем месте."
-
-        tracks.pop(track_index)
-        tracks.append(track)
-        track_index = len(tracks) - 1
-    else:
+    if target_index < 0 or target_index >= len(tracks):
         return track_index, "Не удалось изменить порядок."
+
+    if target_index == track_index:
+        return track_index, "Бит уже на этой позиции."
+
+    tracks.pop(track_index)
+    tracks.insert(target_index, track)
+    track_index = target_index
 
     await state.update_data(tracks=tracks, editing_track_index=track_index)
     return track_index, None
@@ -345,6 +406,29 @@ async def ask_for_cover(message: Message, state: FSMContext):
         state,
         "Теперь отправьте обложку для битпака или нажмите «Без обложки».",
         reply_markup=get_cover_keyboard(),
+    )
+
+
+async def ask_for_author_links(message: Message, state: FSMContext, notice: str | None = None):
+    data = await state.get_data()
+    recent_authors = get_recent_authors(data)
+    text = "Отправьте ссылки на авторов через пробел, запятую или с новой строки."
+
+    if recent_authors:
+        text = (
+            "Отправьте ссылки на авторов через пробел, запятую или с новой строки. "
+            "Ниже есть кнопки с уже использованными соавторами: они копируют ссылку в буфер."
+        )
+
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    await state.set_state(BeatpackState.waiting_for_author_links)
+    await answer_and_track(
+        message,
+        state,
+        text,
+        reply_markup=with_beatpack_back_button(get_recent_authors_keyboard(recent_authors)),
     )
 
 
@@ -661,7 +745,7 @@ async def start_beatpack(message: Message, state: FSMContext, bot: Bot):
     if not await require_subscription(message, bot, "beatpack"):
         return
 
-    await state.update_data(tracks=[])
+    await state.update_data(tracks=[], recent_authors=[])
     await state.set_state(BeatpackState.waiting_for_audio)
     await answer_and_track(
         message,
@@ -684,7 +768,7 @@ async def check_beatpack_subscription(callback: CallbackQuery, state: FSMContext
         await callback.message.edit_reply_markup(reply_markup=None)
         await state.clear()
         await add_cleanup_message(state, callback.message)
-        await state.update_data(tracks=[])
+        await state.update_data(tracks=[], recent_authors=[])
         await state.set_state(BeatpackState.waiting_for_audio)
         await answer_and_track(
             callback.message,
@@ -746,13 +830,7 @@ async def beatpack_collab_yes_handler(callback: CallbackQuery, state: FSMContext
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
         await cleanup_messages(bot, state, callback.message.chat.id)
-        await state.set_state(BeatpackState.waiting_for_author_links)
-        await answer_and_track(
-            callback.message,
-            state,
-            "Отправьте ссылки на авторов через пробел, запятую или с новой строки.",
-            reply_markup=with_beatpack_back_button(),
-        )
+        await ask_for_author_links(callback.message, state)
 
 
 @router.callback_query(BeatpackState.waiting_for_collab_answer, F.data == "beatpack:collab:no")
@@ -772,27 +850,22 @@ async def beatpack_author_links_handler(message: Message, state: FSMContext, bot
     authors = await resolve_authors(bot, message.text)
 
     if not authors:
-        await answer_and_track(
+        await ask_for_author_links(
             message,
             state,
             "Отправьте хотя бы одну ссылку: https://..., t.me/... или @username.",
-            reply_markup=with_beatpack_back_button(),
         )
         return
 
     await update_editing_track(state, authors=authors)
+    await update_recent_authors(state, authors)
     await show_beatpack_track_action_menu(message, state, bot, "Соавторы обновлены.")
 
 
 @router.message(BeatpackState.waiting_for_author_links, is_not_command)
 async def wrong_author_links_handler(message: Message, state: FSMContext):
     await add_cleanup_message(state, message)
-    await answer_and_track(
-        message,
-        state,
-        "Сейчас нужно отправить ссылки на авторов.",
-        reply_markup=with_beatpack_back_button(),
-    )
+    await ask_for_author_links(message, state, "Сейчас нужно отправить ссылки на авторов.")
 
 
 @router.message(BeatpackState.waiting_for_file_name, F.text, is_not_command)
@@ -919,16 +992,47 @@ async def beatpack_track_authors_handler(callback: CallbackQuery, state: FSMCont
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
         await cleanup_messages(bot, state, callback.message.chat.id)
-        await state.set_state(BeatpackState.waiting_for_collab_answer)
-        await answer_and_track(
-            callback.message,
-            state,
-            "Этот бит коллабный?",
-            reply_markup=get_collab_keyboard(),
-        )
+        await ask_for_author_links(callback.message, state)
 
 
-@router.callback_query(BeatpackState.choosing_next_step, F.data.startswith("beatpack:track:move:"))
+@router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:track:move")
+async def beatpack_track_move_menu_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await add_cleanup_message(state, callback.message)
+    data = await state.get_data()
+    tracks = data.get("tracks", [])
+    track_index, track = get_indexed_track(data)
+
+    if not callback.message:
+        await callback.answer()
+        return
+
+    if track_index is None or track is None:
+        await callback.answer("Бит не найден.", show_alert=True)
+        return
+
+    safe_name = get_safe_audio_name(track.get("file_name"), f"beat_{track_index + 1}.mp3")
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await cleanup_messages(bot, state, callback.message.chat.id)
+    await answer_and_track(
+        callback.message,
+        state,
+        f"Выберите новую позицию для «{safe_name}». Сейчас: {track_index + 1} из {len(tracks)}.",
+        reply_markup=get_beatpack_track_position_keyboard(len(tracks)),
+    )
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:track:actions")
+async def beatpack_track_actions_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await show_beatpack_track_action_menu(callback.message, state, bot)
+
+
+@router.callback_query(BeatpackState.choosing_next_step, F.data.startswith("beatpack:track:position:"))
 async def beatpack_track_move_handler(
     callback: CallbackQuery,
     state: FSMContext,
@@ -936,8 +1040,18 @@ async def beatpack_track_move_handler(
     db_session: AsyncSession,
 ):
     await add_cleanup_message(state, callback.message)
-    direction = (callback.data or "").rsplit(":", 1)[-1]
-    _, error = await move_editing_track(state, direction)
+
+    if not callback.message:
+        await callback.answer()
+        return
+
+    try:
+        target_index = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Не удалось изменить порядок.", show_alert=True)
+        return
+
+    _, error = await move_editing_track(state, target_index)
 
     if error:
         await callback.answer(error, show_alert=True)
@@ -945,16 +1059,15 @@ async def beatpack_track_move_handler(
 
     await callback.answer()
 
-    if callback.message:
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await show_beatpack_menu(
-            callback.message,
-            state,
-            bot,
-            db_session,
-            callback.from_user,
-            "Порядок обновлён.",
-        )
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await show_beatpack_menu(
+        callback.message,
+        state,
+        bot,
+        db_session,
+        callback.from_user,
+        "Порядок обновлён.",
+    )
 
 
 @router.callback_query(BeatpackState.choosing_next_step, F.data == "beatpack:track:delete")

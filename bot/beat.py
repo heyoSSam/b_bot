@@ -99,6 +99,21 @@ def get_cover_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+async def ask_for_author_links(message: Message, state: FSMContext, notice: str | None = None):
+    text = "Отправьте ссылки на авторов через пробел, запятую или с новой строки."
+
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    await state.set_state(BeatState.waiting_for_author_links)
+    await answer_and_track(
+        message,
+        state,
+        text,
+        reply_markup=with_beat_back_button(),
+    )
+
+
 def is_not_command(message: Message) -> bool:
     return not (message.text and message.text.startswith("/"))
 
@@ -392,13 +407,7 @@ async def beat_choose_authors_handler(callback: CallbackQuery, state: FSMContext
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
         await cleanup_messages(bot, state, callback.message.chat.id)
-        await state.set_state(BeatState.waiting_for_collab_answer)
-        await answer_and_track(
-            callback.message,
-            state,
-            "Этот бит коллабный?",
-            reply_markup=get_collab_keyboard(),
-        )
+        await ask_for_author_links(callback.message, state)
 
 
 @router.callback_query(BeatState.choosing_next_step, F.data == "beat:cover")
@@ -420,13 +429,7 @@ async def beat_collab_yes_handler(callback: CallbackQuery, state: FSMContext, bo
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
         await cleanup_messages(bot, state, callback.message.chat.id)
-        await state.set_state(BeatState.waiting_for_author_links)
-        await answer_and_track(
-            callback.message,
-            state,
-            "Отправьте ссылки на авторов через пробел, запятую или с новой строки.",
-            reply_markup=with_beat_back_button(),
-        )
+        await ask_for_author_links(callback.message, state)
 
 
 @router.callback_query(BeatState.waiting_for_collab_answer, F.data == "beat:collab:no")
@@ -446,11 +449,10 @@ async def beat_author_links_handler(message: Message, state: FSMContext, bot: Bo
     authors = await resolve_authors(bot, message.text)
 
     if not authors:
-        await answer_and_track(
+        await ask_for_author_links(
             message,
             state,
             "Отправьте хотя бы одну ссылку: https://..., t.me/... или @username.",
-            reply_markup=with_beat_back_button(),
         )
         return
 

@@ -11,6 +11,7 @@ load_dotenv()
 
 from bot.beat import router as beat_router
 from bot.beatpack import router as beatpack_router
+from bot.cleanup import add_cleanup_message, answer_and_track
 from bot.constants import START_GUIDE_TEXT
 from bot.database import async_session, close_db, init_db
 from bot.middleware import DatabaseMiddleware
@@ -37,7 +38,8 @@ dp.include_router(unknown_router)
 async def start(message: Message, state: FSMContext):
     logger.info(f"User {message.from_user.id} started the bot.")
     await state.clear()
-    await message.answer(START_GUIDE_TEXT)
+    await add_cleanup_message(state, message)
+    await answer_and_track(message, state, START_GUIDE_TEXT)
 
 async def main():
     logger.info("Starting bot...")

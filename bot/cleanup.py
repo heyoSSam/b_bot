@@ -28,6 +28,20 @@ async def answer_and_track(message: Message, state: FSMContext, *args: Any, **kw
 async def cleanup_messages(bot: Bot, state: FSMContext, chat_id: int) -> None:
     data = await state.get_data()
     message_ids = list(dict.fromkeys(data.get("cleanup_message_ids", [])))
+    delete_messages = getattr(bot, "delete_messages", None)
+
+    if delete_messages:
+        try:
+            for start_index in range(0, len(message_ids), 100):
+                await delete_messages(
+                    chat_id=chat_id,
+                    message_ids=message_ids[start_index : start_index + 100],
+                )
+        except TelegramAPIError:
+            pass
+        else:
+            await state.update_data(cleanup_message_ids=[])
+            return
 
     for message_id in message_ids:
         try:
