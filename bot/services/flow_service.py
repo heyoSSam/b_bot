@@ -11,6 +11,8 @@ from bot.constants import (
     COVER_IMAGE_TOO_LARGE_TEXT,
     COVER_MAX_FILE_BYTES,
     COVER_MAX_PIXELS,
+    SUBSCRIPTION_CHECK_FAILED_TEXT,
+    SUBSCRIPTION_NOT_FOUND_TEXT,
 )
 from bot.keyboards.common import with_start_button
 from bot.services.audio_service import (
@@ -19,7 +21,11 @@ from bot.services.audio_service import (
     CoverImageTooLargeError,
 )
 from bot.services.cleanup_service import add_cleanup_message, answer_and_track, cleanup_messages
-from bot.services.subscription_service import is_user_subscribed, require_subscription
+from bot.services.subscription_service import (
+    SubscriptionCheckError,
+    is_user_subscribed,
+    require_subscription,
+)
 from bot.utils.file_names import (
     build_file_name_prompt,
     get_file_name_copy_keyboard,
@@ -180,8 +186,14 @@ async def confirm_subscription(
     prompt_text: str,
     reset_data: dict | None = None,
 ) -> bool:
-    if not await is_user_subscribed(bot, callback.from_user.id):
-        await callback.answer("Подписка не найдена.", show_alert=True)
+    try:
+        is_subscribed = await is_user_subscribed(bot, callback.from_user.id)
+    except SubscriptionCheckError:
+        await callback.answer(SUBSCRIPTION_CHECK_FAILED_TEXT, show_alert=True)
+        return False
+
+    if not is_subscribed:
+        await callback.answer(SUBSCRIPTION_NOT_FOUND_TEXT, show_alert=True)
         return False
 
     await callback.answer()

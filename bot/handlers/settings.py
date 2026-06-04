@@ -1,6 +1,5 @@
 import html
 import re
-from urllib.parse import urlparse, urlunparse
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -23,6 +22,8 @@ from bot.services.author_service import resolve_author
 from bot.services.caption_service import build_track_caption_for_style, get_channel_label
 from bot.services.cleanup_service import add_cleanup_message, answer_and_track, cleanup_messages
 from bot.services.subscription_service import (
+    SubscriptionCheckError,
+    get_channel_username,
     get_channel_url,
     get_required_channel_value,
     is_user_subscribed,
@@ -42,6 +43,8 @@ from bot.constants import (
     SET_STYLE_RAW_INPUT_PROMPT,
     SET_STYLE_RAW_INPUT_WITHOUT_CHANNEL_PROMPT,
     SET_STYLE_TEXT_INPUT_PROMPT,
+    SUBSCRIPTION_CHECK_FAILED_TEXT,
+    SUBSCRIPTION_NOT_FOUND_TEXT,
 )
 from bot.handlers.navigation import send_start_screen
 
@@ -54,29 +57,12 @@ def is_not_command(message: Message) -> bool:
 
 
 def normalize_channel_url(value: str) -> str | None:
-    channel = value.strip()
+    channel_username = get_channel_username(value)
 
-    if not channel or any(character.isspace() for character in channel):
+    if not channel_username:
         return None
 
-    if channel.startswith("@") and len(channel) > 1:
-        return f"https://t.me/{channel[1:]}"
-
-    if channel.startswith("t.me/"):
-        channel = f"https://{channel}"
-
-    if not channel.startswith(("http://", "https://")):
-        return f"https://t.me/{channel}"
-
-    parsed = urlparse(channel)
-
-    if parsed.netloc.lower() not in {"t.me", "telegram.me"}:
-        return None
-
-    if not parsed.path.strip("/"):
-        return None
-
-    return urlunparse(("https", "t.me", parsed.path.rstrip("/"), "", "", ""))
+    return get_channel_url(channel_username)
 
 
 def clean_name_style(value: str, has_channel: bool = True) -> str | None:
@@ -401,8 +387,14 @@ async def start_set_style(
 
 @router.callback_query(F.data == "subscription:check:onboarding")
 async def check_onboarding_subscription(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    if not await is_user_subscribed(bot, callback.from_user.id):
-        await callback.answer("Подписка не найдена.", show_alert=True)
+    try:
+        is_subscribed = await is_user_subscribed(bot, callback.from_user.id)
+    except SubscriptionCheckError:
+        await callback.answer(SUBSCRIPTION_CHECK_FAILED_TEXT, show_alert=True)
+        return
+
+    if not is_subscribed:
+        await callback.answer(SUBSCRIPTION_NOT_FOUND_TEXT, show_alert=True)
         return
 
     await callback.answer()

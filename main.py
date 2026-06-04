@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from bot.db.session import async_session, close_db, init_db
+from bot.db.session import async_session, close_db
 from bot.handlers.beat import router as beat_router
 from bot.handlers.beatpack import router as beatpack_router
 from bot.handlers.navigation import router as navigation_router, send_start_screen
@@ -46,7 +46,6 @@ async def start(message: Message, state: FSMContext, db_session, bot: Bot):
 
 async def main():
     logger.info("Starting bot...")
-    await init_db()
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Показать команды"),

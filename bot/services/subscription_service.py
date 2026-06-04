@@ -1,16 +1,25 @@
 import logging
 import os
+import re
 from urllib.parse import urlparse
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.constants import SUBSCRIPTION_REQUIRED_TEXT
+from bot.constants import (
+    SUBSCRIPTION_CHECK_FAILED_TEXT,
+    SUBSCRIPTION_REQUIRED_TEXT,
+    TELEGRAM_PUBLIC_NAME_PATTERN,
+)
 from bot.keyboards.common import with_start_button
 
 
 logger = logging.getLogger(__name__)
+
+
+class SubscriptionCheckError(Exception):
+    pass
 
 
 def get_required_channel_value() -> str | None:
@@ -27,40 +36,56 @@ def get_required_channel_value() -> str | None:
     return value
 
 
+def normalize_public_channel_username(value: str) -> str | None:
+    channel = value.strip()
+
+    if not channel or any(character.isspace() for character in channel):
+        return None
+
+    if channel.startswith("@"):
+        username = channel[1:]
+    else:
+        if channel.startswith("t.me/"):
+            channel = f"https://{channel}"
+
+        if channel.startswith(("http://", "https://")):
+            parsed = urlparse(channel)
+
+            if parsed.netloc.lower() not in {"t.me", "telegram.me"}:
+                return None
+
+            if parsed.query or parsed.fragment:
+                return None
+
+            path_parts = [part for part in parsed.path.split("/") if part]
+
+            if len(path_parts) != 1:
+                return None
+
+            username = path_parts[0]
+        else:
+            username = channel
+
+    if username.lower() in {"c", "joinchat"}:
+        return None
+
+    if not re.fullmatch(TELEGRAM_PUBLIC_NAME_PATTERN, username):
+        return None
+
+    return f"@{username}"
+
+
 def get_channel_username(value: str) -> str | None:
-    if value.startswith("@") and len(value) > 1:
-        return value
-
-    if value.startswith("t.me/"):
-        value = f"https://{value}"
-
-    if value.startswith(("http://", "https://")):
-        parsed = urlparse(value)
-
-        if parsed.netloc.lower() not in {"t.me", "telegram.me"}:
-            return None
-
-        username = parsed.path.strip("/").split("/", 1)[0]
-
-        if not username or username.startswith("+") or username in {"c", "joinchat"}:
-            return None
-
-        return f"@{username}"
-
-    return f"@{value}"
+    return normalize_public_channel_username(value)
 
 
 def get_channel_url(value: str) -> str:
-    if value.startswith(("http://", "https://")):
-        return value
+    channel_username = get_channel_username(value)
 
-    if value.startswith("t.me/"):
-        return f"https://{value}"
+    if not channel_username:
+        raise ValueError("Channel value must be a public Telegram username or URL")
 
-    if value.startswith("@"):
-        return f"https://t.me/{value[1:]}"
-
-    return f"https://t.me/{value}"
+    return f"https://t.me/{channel_username[1:]}"
 
 
 def get_subscription_keyboard(command: str) -> InlineKeyboardMarkup:
@@ -85,13 +110,13 @@ async def is_user_subscribed(bot: Bot, user_id: int) -> bool:
 
     if not channel_username:
         logger.error("REQUIRED_CHANNEL_USERNAME must be a public Telegram channel link or @username")
-        return False
+        raise SubscriptionCheckError
 
     try:
         member = await bot.get_chat_member(chat_id=channel_username, user_id=user_id)
     except TelegramAPIError:
         logger.exception("Failed to check subscription for channel %s", channel_username)
-        return False
+        raise SubscriptionCheckError from None
 
     return member.status not in {"left", "kicked"}
 
@@ -100,7 +125,16 @@ async def require_subscription(message: Message, bot: Bot, command: str) -> bool
     if not message.from_user:
         return False
 
-    if await is_user_subscribed(bot, message.from_user.id):
+    try:
+        is_subscribed = await is_user_subscribed(bot, message.from_user.id)
+    except SubscriptionCheckError:
+        await message.answer(
+            SUBSCRIPTION_CHECK_FAILED_TEXT,
+            reply_markup=with_start_button(),
+        )
+        return False
+
+    if is_subscribed:
         return True
 
     await message.answer(

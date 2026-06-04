@@ -25,6 +25,7 @@ DEFAULT_NAME_STYLE = "{me}"
 
 NAME_STYLE_TOKEN_PATTERN = r"\{(me|channel|co-author)(?::([^{}]*))?\}"
 NAME_STYLE_MAX_LENGTH = 500
+TELEGRAM_PUBLIC_NAME_PATTERN = r"[A-Za-z0-9_]{4,32}"
 
 SET_STYLE_CONSTRUCTOR_TEXT = """Конструктор шаблона подписи.
 
@@ -81,6 +82,8 @@ SET_CHANNEL_GUIDE_TEXT = """Отправьте ссылку на Telegram-кан
 После этого ваш канал будет доступен для переиспользования в форматировании."""
 
 SUBSCRIPTION_REQUIRED_TEXT = "Чтобы пользоваться этой командой, подпишитесь на канал."
+SUBSCRIPTION_NOT_FOUND_TEXT = "Подписка не найдена."
+SUBSCRIPTION_CHECK_FAILED_TEXT = "Не удалось проверить подписку. Попробуйте ещё раз позже."
 
 FILE_NAME_RENAME_PROMPT_TEXT = """Отправьте новое название файла.
 
