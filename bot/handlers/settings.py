@@ -21,6 +21,12 @@ from bot.keyboards.settings import (
 from bot.services.author_service import resolve_author
 from bot.services.caption_service import build_track_caption_for_style, get_channel_label
 from bot.services.cleanup_service import add_cleanup_message, answer_and_track, cleanup_messages
+from bot.services.gemini_style_service import (
+    GeminiStyleConfigError,
+    GeminiStyleResponseError,
+    GeminiStyleUnavailableError,
+    infer_name_style_with_gemini,
+)
 from bot.services.subscription_service import (
     SubscriptionCheckError,
     get_channel_username,
@@ -36,6 +42,7 @@ from bot.constants import (
     NAME_STYLE_TOKEN_PATTERN,
     ONBOARDING_CHANNEL_GUIDE_TEXT,
     SET_CHANNEL_GUIDE_TEXT,
+    SET_STYLE_AI_INPUT_PROMPT,
     SET_STYLE_CO_AUTHOR_TEXT_INPUT_PROMPT,
     SET_STYLE_CONSTRUCTOR_TEXT,
     SET_STYLE_ME_TEXT_INPUT_PROMPT,
@@ -103,7 +110,7 @@ def get_name_style_validation_error(value: str, has_channel: bool = True) -> str
         return f"Шаблон слишком длинный. Максимум: {NAME_STYLE_MAX_LENGTH} символов."
 
     if has_unknown_name_style_braces(style):
-        return "Не понял переменную в фигурных скобках. Используйте кнопки конструктора или доступные переменные."
+        return "Не понял переменную в фигурных скобках. Проверьте разбор подписи и доступные переменные."
 
     if not has_channel and has_channel_token(style):
         return "Сначала сохраните канал через /set_channel, потом добавьте {channel} в шаблон."
@@ -117,8 +124,6 @@ def get_style_display(style: str) -> str:
 
 def add_trailing_space(value: str) -> str:
     return value if value.endswith(" ") else f"{value} "
-
-
 
 
 def build_style_constructor_text(style: str, notice: str | None = None) -> str:
@@ -354,13 +359,15 @@ async def start_set_style_flow(
     db_session: AsyncSession,
     is_registration: bool = False,
     notice: str | None = None,
+    telegram_user_id: int | None = None,
 ) -> None:
     await cleanup_messages(bot, state, message.chat.id)
     await state.clear()
     await add_cleanup_message(state, message)
     await state.set_state(SettingsState.editing_style)
 
-    user = await get_user(db_session, message.from_user.id) if message.from_user else None
+    user_id = telegram_user_id or (message.from_user.id if message.from_user else None)
+    user = await get_user(db_session, user_id) if user_id else None
     has_channel = bool(user and user.telegram_channel_url)
     style = user.name_style if user else DEFAULT_NAME_STYLE
     await state.update_data(
@@ -414,7 +421,13 @@ async def start_set_style_from_menu(
     await callback.answer()
 
     if callback.message:
-        await start_set_style_flow(callback.message, state, bot, db_session)
+        await start_set_style_flow(
+            callback.message,
+            state,
+            bot,
+            db_session,
+            telegram_user_id=callback.from_user.id,
+        )
 
 
 @router.callback_query(SettingsState.editing_style, F.data == "settings:style:add_me")
@@ -560,6 +573,24 @@ async def start_add_style_text(callback: CallbackQuery, state: FSMContext, bot: 
     )
 
 
+@router.callback_query(SettingsState.editing_style, F.data == "settings:style:ai")
+async def start_ai_style_input(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await add_cleanup_message(state, callback.message)
+
+    if not callback.message:
+        return
+
+    await cleanup_messages(bot, state, callback.message.chat.id)
+    await state.set_state(SettingsState.waiting_for_style_ai_description)
+    await answer_and_track(
+        callback.message,
+        state,
+        SET_STYLE_AI_INPUT_PROMPT,
+        reply_markup=with_start_button(),
+    )
+
+
 @router.callback_query(SettingsState.editing_style, F.data == "settings:style:manual")
 async def start_manual_style_input(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
@@ -681,11 +712,10 @@ async def save_style_draft(
             )
             return
 
-        await answer_and_track(
+        await send_start_screen(
             callback.message,
             state,
             "Шаблон подписи сохранён.",
-            reply_markup=with_start_button(),
         )
 
 
@@ -751,6 +781,104 @@ async def add_style_text_handler(message: Message, state: FSMContext, bot: Bot):
     await cleanup_messages(bot, state, message.chat.id)
     await state.set_state(SettingsState.editing_style)
     await send_style_constructor(message, state, style, "Текст добавлен.")
+
+
+@router.message(SettingsState.waiting_for_style_ai_description, F.text, is_not_command)
+async def infer_style_with_ai_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db_session: AsyncSession,
+):
+    await add_cleanup_message(state, message)
+    text = message.text
+
+    if not text or not text.strip():
+        await answer_and_track(
+            message,
+            state,
+            "Отправьте пример подписи и её разбор текстом.",
+            reply_markup=with_start_button(),
+        )
+        return
+
+    await answer_and_track(
+        message,
+        state,
+        "Разбираю подпись через ИИ. Это может занять несколько секунд.",
+        reply_markup=with_start_button(),
+    )
+
+    has_channel = await get_style_has_channel(state)
+
+    try:
+        result = await infer_name_style_with_gemini(text, has_channel)
+    except GeminiStyleConfigError:
+        await answer_and_track(
+            message,
+            state,
+            "GEMINI_API_KEY не настроен. Сейчас разбор подписи через ИИ недоступен.",
+            reply_markup=with_start_button(),
+        )
+        return
+    except GeminiStyleUnavailableError:
+        await answer_and_track(
+            message,
+            state,
+            "Сервис разбора подписи временно недоступен. Повторите попытку позже.",
+            reply_markup=with_start_button(),
+        )
+        return
+    except GeminiStyleResponseError as error:
+        await answer_and_track(
+            message,
+            state,
+            f"Не удалось разобрать подпись через Gemini: {error}. Попробуйте уточнить разбор и отправить его ещё раз.",
+            reply_markup=with_start_button(),
+        )
+        return
+
+    if result.clarification_question:
+        await answer_and_track(
+            message,
+            state,
+            f"Нужно уточнение:\n{result.clarification_question}",
+            reply_markup=with_start_button(),
+        )
+        return
+
+    style = clean_name_style(result.style, has_channel)
+
+    if not style:
+        await answer_and_track(
+            message,
+            state,
+            get_name_style_validation_error(result.style, has_channel)
+            or "Не удалось собрать корректный шаблон. Попробуйте уточнить разбор и отправить его ещё раз.",
+            reply_markup=with_start_button(),
+        )
+        return
+
+    data = await state.get_data()
+    is_registration = bool(data.get("registration_flow"))
+    await set_user_name_style(db_session, message.from_user, style.strip())
+    await cleanup_messages(bot, state, message.chat.id)
+
+    if is_registration:
+        await send_start_screen(
+            message,
+            state,
+            "Шаблон подписи сохранён.\n\nРегистрация завершена. Теперь можно пользоваться ботом.",
+        )
+        return
+
+    await start_set_style_flow(
+        message,
+        state,
+        bot,
+        db_session,
+        notice="Шаблон подписи сохранён.",
+    )
 
 
 @router.message(SettingsState.waiting_for_style_me_text, F.text, is_not_command)
@@ -841,6 +969,17 @@ async def wrong_style_text_input(message: Message, state: FSMContext):
     )
 
 
+@router.message(SettingsState.waiting_for_style_ai_description, is_not_command)
+async def wrong_style_ai_input(message: Message, state: FSMContext):
+    await add_cleanup_message(state, message)
+    await answer_and_track(
+        message,
+        state,
+        "Отправьте подпись и разбор текстом.",
+        reply_markup=with_start_button(),
+    )
+
+
 @router.message(SettingsState.waiting_for_style_me_text, is_not_command)
 async def wrong_style_me_text_input(message: Message, state: FSMContext):
     await add_cleanup_message(state, message)
@@ -891,6 +1030,6 @@ async def wrong_style_constructor_input(message: Message, state: FSMContext):
     await answer_and_track(
         message,
         state,
-        "Используйте кнопки конструктора или выберите «Ввести шаблон вручную».",
+        "Используйте кнопки «Предпросмотр» или «Изменить».",
         reply_markup=with_start_button(),
     )

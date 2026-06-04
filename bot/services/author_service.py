@@ -4,6 +4,8 @@ from urllib.parse import urlparse
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
+from bot.services.subscription_service import get_channel_url, get_channel_username
+
 
 class TooManyAuthorsError(Exception):
     pass
@@ -18,25 +20,16 @@ def split_author_tokens(text: str) -> list[str]:
 
 
 def normalize_author_url(value: str) -> str | None:
-    token = value.strip()
+    username = get_channel_username(value)
 
-    if token.startswith("@") and len(token) > 1:
-        return f"https://t.me/{token[1:]}"
+    if not username:
+        return None
 
-    if token.startswith("t.me/"):
-        return f"https://{token}"
-
-    if token.startswith(("http://", "https://", "tg://")):
-        return token
-
-    return None
+    return get_channel_url(username)
 
 
 def get_telegram_username(url: str) -> str | None:
     parsed = urlparse(url)
-
-    if parsed.scheme == "tg":
-        return None
 
     if parsed.netloc.lower() not in {"t.me", "telegram.me"}:
         return None
@@ -51,9 +44,6 @@ def get_telegram_username(url: str) -> str | None:
 
 def get_fallback_label(url: str) -> str:
     parsed = urlparse(url)
-
-    if parsed.scheme == "tg":
-        return "автор"
 
     if parsed.netloc.lower() in {"t.me", "telegram.me"}:
         username = get_telegram_username(url)
